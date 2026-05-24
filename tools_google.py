@@ -65,7 +65,7 @@ def send_email(to: str, subject: str, body: str) -> str:
     """
     try:
         creds = get_google_credentials()
-        service = build('gmail', 'v1', credentials=creds)
+        service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
         
         # Create the email
         message = MIMEText(body)
@@ -112,9 +112,10 @@ def get_emails(max_results: int = 500) -> list[dict]:
     if not stubs:
         return []
 
-    # Each thread builds its own service instance to avoid shared-state issues
+    # Each thread builds its own service — cache_discovery=False avoids
+    # filesystem race conditions when multiple threads call build() simultaneously
     def fetch_meta(stub):
-        svc    = build('gmail', 'v1', credentials=creds)
+        svc    = build('gmail', 'v1', credentials=creds, cache_discovery=False)
         detail = svc.users().messages().get(
             userId='me',
             id=stub['id'],
@@ -170,7 +171,7 @@ def get_thread_text(thread_id: str, max_chars: int = 8000) -> str:
     Each message is prefixed with direction (SENT/RECEIVED), sender, and date.
     """
     creds   = get_google_credentials()
-    service = build('gmail', 'v1', credentials=creds)
+    service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
 
     thread   = service.users().threads().get(userId='me', id=thread_id, format='full').execute()
     sections = []
@@ -201,7 +202,7 @@ def send_reply(to: str, subject: str, body: str, thread_id: str, in_reply_to: st
     """
     try:
         creds   = get_google_credentials()
-        service = build('gmail', 'v1', credentials=creds)
+        service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
 
         reply_subject = subject if subject.lower().startswith('re:') else f'Re: {subject}'
 
@@ -238,7 +239,7 @@ def create_calendar_event(summary: str, start_time: str, end_time: str,
         TIMEZONE = os.getenv("TIMEZONE", "Pacific/Auckland")
         
         creds = get_google_credentials()
-        service = build('calendar', 'v3', credentials=creds)
+        service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
         
         event = {
             'summary': summary,
