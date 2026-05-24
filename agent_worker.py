@@ -139,22 +139,29 @@ def run_worker():
                 task_id = task["id"]
                 input_text = task["input_text"]
                 
-                print(f"\n{'='*60}")
-                print(f"📋 NEW TASK: {task_id}")
-                print(f"   Input: {input_text}")
-                print(f"{'='*60}")
-                
+                print(f"\n{'='*60}", flush=True)
+                print(f"📋 NEW TASK: {task_id}", flush=True)
+                print(f"   Input:   {input_text}", flush=True)
+                print(f"   Status:  {task.get('status')}", flush=True)
+                print(f"   Trusted: {task.get('trusted', False)}", flush=True)
+                print(f"{'='*60}", flush=True)
+
                 # Mark as running
                 client.update_status(task_id, "running")
                 client.log(task_id, "Agent picked up task", "info")
-                
+
+                t_start = datetime.now()
                 try:
-                    # Classify intent and run the appropriate workflow
                     route_workflow(task_id, input_text, client)
-                    
+                    elapsed = (datetime.now() - t_start).total_seconds()
+                    print(f"\n✅ Task {task_id} finished in {elapsed:.1f}s", flush=True)
+
                 except Exception as e:
+                    import traceback
                     error_msg = str(e)
-                    print(f"❌ Workflow error: {error_msg}")
+                    elapsed   = (datetime.now() - t_start).total_seconds()
+                    print(f"\n❌ Workflow error after {elapsed:.1f}s: {error_msg}", flush=True)
+                    print(traceback.format_exc(), flush=True)
                     client.log(task_id, f"Error: {error_msg}", "error")
                     client.update_status(task_id, "failed", error_message=error_msg)
             

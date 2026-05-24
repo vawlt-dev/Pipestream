@@ -50,20 +50,23 @@ def load_workflows() -> dict:
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
-            print(f"⚠️  Failed to load workflow '{fname}': {e}")
+            import traceback
+            print(f"⚠️  Failed to load workflow '{fname}': {e}", flush=True)
+            print(traceback.format_exc(), flush=True)
             continue
 
         meta = getattr(mod, "WORKFLOW_META", None)
         run  = getattr(mod, "run", None)
 
         if not (meta and isinstance(meta, dict) and "name" in meta and "description" in meta):
-            print(f"⚠️  Skipping '{fname}': missing or invalid WORKFLOW_META")
+            print(f"⚠️  Skipping '{fname}': missing or invalid WORKFLOW_META", flush=True)
             continue
 
         if not callable(run):
-            print(f"⚠️  Skipping '{fname}': no callable run() function")
+            print(f"⚠️  Skipping '{fname}': no callable run() function", flush=True)
             continue
 
+        print(f"  ✓ Loaded workflow: {meta['name']}  ({fname})", flush=True)
         registry[meta["name"]] = {"meta": meta, "run": run}
 
     return registry
@@ -108,6 +111,7 @@ def route_workflow(task_id: str, input_text: str, client, _depth: int = 0) -> No
         client.log(task_id, msg, log_type)
 
     registry = load_workflows()
+    print(f"\n  [ROUTER] Loaded {len(registry)} workflow(s): {list(registry.keys())}", flush=True)
 
     if not registry:
         log("No workflows found in workflows/ directory", "error")
