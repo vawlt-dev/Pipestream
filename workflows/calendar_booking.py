@@ -22,9 +22,64 @@ WORKFLOW_META = {
     "description": (
         "Schedule, book, or add a calendar event or appointment. Use this when the "
         "request mentions booking, scheduling, adding to calendar, setting a meeting, "
-        "or any time-based event."
+        "or any time-based event. "
+        "Can also be called programmatically by other workflows via book_directly(task_id, "
+        "event_name, dt, duration_mins, location, client) when all details are already "
+        "known — skips all parsing and confirmation questions."
     ),
 }
+
+
+def book_directly(
+    task_id: str,
+    event_name: str,
+    dt,
+    duration_mins: int = 60,
+    location: str = '',
+    client = None,
+) -> bool:
+    """
+    Programmatic entry point — skips all parsing and confirmation.
+    Call this from other workflows when you already have structured booking data.
+
+    Args:
+        task_id:       Parent task ID (for logging)
+        event_name:    Title of the event
+        dt:            datetime object for the start time
+        duration_mins: Length in minutes (default 60)
+        location:      Optional location string
+        client:        VPSClient instance
+
+    Returns:
+        True on success, False on failure.
+    """
+    from datetime import timedelta
+
+    def log(msg: str, log_type: str = 'info'):
+        print(f'  [{log_type.upper()}] {msg}')
+        if client:
+            client.log(task_id, msg, log_type)
+
+    dt_end = dt + timedelta(minutes=duration_mins)
+    log(f'📅 Booking directly: "{event_name}" at {dt.isoformat()}', 'info')
+    log(f'🔧 create_calendar_event({event_name}, {dt.isoformat()}, {dt_end.isoformat()})', 'tool_call')
+
+    result = create_calendar_event(
+        summary=event_name,
+        start_time=dt.isoformat(),
+        end_time=dt_end.isoformat(),
+        description='Booked via Pipestream',
+        location=location,
+    )
+
+    log(f'📤 {result}', 'tool_result')
+
+    if '✅' in result:
+        log(f'🎉 "{event_name}" booked successfully', 'success')
+        return True
+    else:
+        log(f'Failed to book "{event_name}": {result}', 'error')
+        return False
 
 
 def run(task_id: str, input_text: str, client) -> None:
