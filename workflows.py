@@ -125,29 +125,200 @@ def parse_duration(duration_str: str) -> int:
     return total if total > 0 else 60
 
 # =============================================================================
+# DEEP RESEARCH
+# =============================================================================
+
+def deep_research(company_name: str, task_id: str, client, log) -> dict:
+    """
+    Multi-round recursive research:
+      1. Discovery searches → collect URLs
+      2. LLM selects best URLs to scrape
+      3. Scrape selected pages
+      4. LLM evaluates gaps → issues targeted follow-up searches
+      5. Scrape follow-up URLs if budget allows
+      6. Final structured extraction
+
+    Returns dict: company_summary, recent_news, key_person, contact_email,
+                  confidence, raw (extracted text), all_content (full corpus).
+    Returns empty dict if task is cancelled mid-research.
+    """
+    MAX_SCRAPES = 4
+
+    all_snippets: list[str] = []
+    all_scraped:  list[str] = []
+    scrape_count  = 0
+
+    # -------------------------------------------------------------------------
+    # Round 1 — Discovery searches
+    # -------------------------------------------------------------------------
+    log("🔬 Round 1: Discovery searches", "info")
+
+    discovery_queries = [
+        f"{company_name} New Zealand",
+        f"{company_name} about leadership team",
+        f"{company_name} contact email",
+    ]
+
+    candidate_urls: list[str] = []
+
+    for query in discovery_queries:
+        log(f"🔍 {query}", "tool_call")
+        result = web_search(query, max_results=5)
+        all_snippets.append(f"Search: {query}\n{result}")
+        urls = re.findall(r'^(https?://\S+)', result, re.MULTILINE)
+        candidate_urls.extend(urls)
+        log(f"Got {len(result)} chars, {len(urls)} URLs", "tool_result")
+        if check_cancelled(task_id, client):
+            return {}
+
+    # -------------------------------------------------------------------------
+    # LLM picks best URLs to scrape
+    # -------------------------------------------------------------------------
+    unique_urls = list(dict.fromkeys(candidate_urls))[:15]
+    url_list = "\n".join(f"- {u}" for u in unique_urls)
+
+    select_prompt = f"""From these URLs found while researching "{company_name}", select up to 3 that are most likely to contain rich information (company website, About/Team page, news article, contact page). Prefer official company domains.
+
+URLs:
+{url_list}
+
+Reply with ONLY a JSON array of up to 3 URLs:
+["https://...", "https://..."]"""
+
+    try:
+        selected_raw = llm_call(select_prompt)
+        json_match = re.search(r'\[.*?\]', selected_raw, re.DOTALL)
+        selected_urls: list[str] = json.loads(json_match.group())[:3] if json_match else unique_urls[:3]
+    except Exception:
+        selected_urls = unique_urls[:3]
+
+    # -------------------------------------------------------------------------
+    # Scrape selected URLs
+    # -------------------------------------------------------------------------
+    for url in selected_urls:
+        if scrape_count >= MAX_SCRAPES:
+            break
+        log(f"🌐 Scraping: {url}", "tool_call")
+        content = scrape_url(url, max_chars=4000)
+        all_scraped.append(f"FROM {url}:\n{content}")
+        scrape_count += 1
+        log(f"Got {len(content)} chars", "tool_result")
+        if check_cancelled(task_id, client):
+            return {}
+
+    # -------------------------------------------------------------------------
+    # Round 2 — LLM evaluates gaps, issues follow-up searches
+    # -------------------------------------------------------------------------
+    log("🔬 Round 2: Evaluating research gaps", "info")
+
+    combined = "\n\n---\n\n".join(all_snippets + all_scraped)
+
+    evaluate_prompt = f"""You are researching "{company_name}" to write a personalized intro email. Evaluate what you know and what's still missing.
+
+Research so far:
+{combined[:10000]}
+
+Respond in this exact format:
+CONFIDENCE: <high/medium/low>
+WHAT_WE_KNOW: <one sentence summary of what is clear>
+MISSING: <what is still unknown, e.g. "key person name", "recent news", "contact email", or "nothing">
+FOLLOW_UP_SEARCHES: <up to 2 specific search queries to fill the gaps, comma-separated, or "none">"""
+
+    evaluation = llm_call(evaluate_prompt)
+    log(f"Gap analysis:\n{evaluation}", "agent")
+    if check_cancelled(task_id, client):
+        return {}
+
+    confidence    = extract_field(evaluation, "CONFIDENCE")
+    follow_up_raw = extract_field(evaluation, "FOLLOW_UP_SEARCHES")
+
+    # -------------------------------------------------------------------------
+    # Follow-up searches (only if confidence isn't already high)
+    # -------------------------------------------------------------------------
+    if confidence.lower() != "high" and follow_up_raw.lower() not in ("none", "not found", ""):
+        follow_up_queries = [
+            q.strip().strip('"').strip("'")
+            for q in re.split(r',|\n', follow_up_raw)
+            if q.strip() and q.strip().lower() not in ("none", "not found")
+        ][:2]
+
+        for query in follow_up_queries:
+            log(f"🔍 Follow-up: {query}", "tool_call")
+            result = web_search(query, max_results=4)
+            all_snippets.append(f"Follow-up search: {query}\n{result}")
+            log(f"Got {len(result)} chars", "tool_result")
+            if check_cancelled(task_id, client):
+                return {}
+
+            # Scrape the top URL from each follow-up if budget allows
+            if scrape_count < MAX_SCRAPES:
+                follow_urls = re.findall(r'^(https?://\S+)', result, re.MULTILINE)
+                if follow_urls:
+                    url = follow_urls[0]
+                    log(f"🌐 Scraping follow-up: {url}", "tool_call")
+                    content = scrape_url(url, max_chars=3000)
+                    all_scraped.append(f"FROM {url}:\n{content}")
+                    scrape_count += 1
+                    log(f"Got {len(content)} chars", "tool_result")
+                    if check_cancelled(task_id, client):
+                        return {}
+
+    # -------------------------------------------------------------------------
+    # Final structured extraction
+    # -------------------------------------------------------------------------
+    log("📋 Final extraction pass", "info")
+
+    all_content = "\n\n---\n\n".join(all_snippets + all_scraped)
+
+    extract_prompt = f"""Based on all this research about "{company_name}", extract the following fields precisely.
+
+COMPANY_SUMMARY: What does this company do? (1-2 sentences)
+RECENT_NEWS: Any recent news, achievements, funding, or milestones? (1 sentence, or "none found")
+KEY_PERSON: Name and title of the most senior person found (CEO, founder, director)? (or "not found")
+CONTACT_EMAIL: Any contact email address? (or "not found")
+CONFIDENCE: Overall confidence in accuracy of the above (high/medium/low)
+
+Research:
+{all_content[:12000]}
+
+Respond in the exact format above:"""
+
+    extracted = llm_call(extract_prompt)
+    log(f"Research complete:\n{extracted}", "agent")
+
+    return {
+        "company_summary": extract_field(extracted, "COMPANY_SUMMARY"),
+        "recent_news":     extract_field(extracted, "RECENT_NEWS"),
+        "key_person":      extract_field(extracted, "KEY_PERSON"),
+        "contact_email":   extract_field(extracted, "CONTACT_EMAIL"),
+        "confidence":      extract_field(extracted, "CONFIDENCE"),
+        "raw":             extracted,
+        "all_content":     all_content,
+    }
+
+# =============================================================================
 # BUSINESS INTRO WORKFLOW
 # =============================================================================
 
 def business_intro_workflow(task_id: str, input_text: str, client):
     """
     Main workflow: Research company, draft email, get approval, send.
-    
+
     Args:
         task_id: Unique task identifier
         input_text: User's original request
         client: VPSClient for logging and status updates
     """
-    
+
     def log(msg: str, log_type: str = "info"):
-        """Log to both console and VPS."""
         print(f"  [{log_type.upper()}] {msg}")
         client.log(task_id, msg, log_type)
-    
+
     # =========================================================================
     # STEP 1: Parse the user input
     # =========================================================================
     log("Step 1: Parsing input...", "info")
-    
+
     parse_prompt = f"""Extract the following from this request:
 - Company name to research
 - Email address to send to (if provided)
@@ -171,119 +342,61 @@ Now parse the request:"""
 
     parsed = llm_call(parse_prompt)
     log(f"Parsed: {parsed}", "agent")
-    
-    # Extract company and email
+
     company_match = re.search(r"COMPANY:\s*(.+)", parsed, re.IGNORECASE)
-    email_match = re.search(r"EMAIL:\s*(.+)", parsed, re.IGNORECASE)
-    
+    email_match   = re.search(r"EMAIL:\s*(.+)", parsed, re.IGNORECASE)
+
     company_name = company_match.group(1).strip() if company_match else None
     target_email = email_match.group(1).strip() if email_match else None
-    
+
     if target_email and target_email.lower() == "not provided":
         target_email = None
-    
+
     if not company_name:
         log("Could not identify company name from input", "error")
         client.update_status(task_id, "failed", error_message="Could not identify company name")
         return
-    
+
     log(f"Company: {company_name}", "info")
-    log(f"Email: {target_email or 'Not provided - will need to find'}", "info")
-    
+    log(f"Email: {target_email or 'Not provided — will search'}", "info")
+
     client.update_status(task_id, "running", company_name=company_name)
-    
+
     # =========================================================================
-    # STEP 2: Research the company (multiple searches)
+    # STEP 2: Deep recursive research
     # =========================================================================
-    log("Step 2: Researching company...", "info")
-    
-    research_results = []
-    
-    # Search 1: General company info
-    log(f"🔍 Searching: {company_name} New Zealand", "tool_call")
-    result1 = web_search(f"{company_name} New Zealand")
-    research_results.append(f"General search:\n{result1}")
-    log(f"Found {len(result1)} chars of results", "tool_result")
-    if check_cancelled(task_id, client): return
+    log("Step 2: Starting deep research...", "info")
 
-    # Search 2: Recent news
-    log(f"🔍 Searching: {company_name} news recent", "tool_call")
-    result2 = web_search(f"{company_name} news recent")
-    research_results.append(f"News search:\n{result2}")
-    log(f"Found {len(result2)} chars of results", "tool_result")
-    if check_cancelled(task_id, client): return
+    research = deep_research(company_name, task_id, client, log)
+    if not research:
+        return  # cancelled mid-research
 
-    # Search 3: Key people / leadership
-    log(f"🔍 Searching: {company_name} CEO founder leadership", "tool_call")
-    result3 = web_search(f"{company_name} CEO founder leadership team")
-    research_results.append(f"Leadership search:\n{result3}")
-    log(f"Found {len(result3)} chars of results", "tool_result")
-    if check_cancelled(task_id, client): return
+    company_summary = research["company_summary"]
+    recent_news     = research["recent_news"]
+    key_person      = research["key_person"]
+    found_email     = research["contact_email"]
+    confidence      = research["confidence"]
 
-    # If no email provided, try to find one
-    if not target_email:
-        log(f"🔍 Searching: {company_name} contact email", "tool_call")
-        result4 = web_search(f"{company_name} contact email")
-        research_results.append(f"Contact search:\n{result4}")
-        log(f"Found {len(result4)} chars of results", "tool_result")
-        if check_cancelled(task_id, client): return
-    
-    all_research = "\n\n---\n\n".join(research_results)
-    
-    # =========================================================================
-    # STEP 3: Extract structured info from research
-    # =========================================================================
-    log("Step 3: Extracting key information...", "info")
-    
-    extract_prompt = f"""Based on this research about "{company_name}", extract:
-
-1. COMPANY_SUMMARY: What does this company do? (1-2 sentences)
-2. RECENT_NEWS: Any recent news, achievements, funding, or milestones? (1 sentence, or "none found")
-3. KEY_PERSON: Name and title of a key person (CEO, founder, manager)? (or "not found")
-4. CONTACT_EMAIL: Any contact email found? (or "not found")
-5. CONFIDENCE: How confident are you this info is accurate? (high/medium/low)
-
-Research:
-{all_research[:8000]}
-
-Respond in this exact format:
-COMPANY_SUMMARY: <summary>
-RECENT_NEWS: <news or "none found">
-KEY_PERSON: <name and title or "not found">
-CONTACT_EMAIL: <email or "not found">
-CONFIDENCE: <high/medium/low>"""
-
-    extracted = llm_call(extract_prompt)
-    log(f"Extracted info:\n{extracted}", "agent")
-    
-    company_summary = extract_field(extracted, "COMPANY_SUMMARY")
-    recent_news = extract_field(extracted, "RECENT_NEWS")
-    key_person = extract_field(extracted, "KEY_PERSON")
-    found_email = extract_field(extracted, "CONTACT_EMAIL")
-    confidence = extract_field(extracted, "CONFIDENCE")
-    
     # Use found email if we didn't have one
     if not target_email and found_email and found_email.lower() != "not found":
         if "@" in found_email:
             target_email = found_email
             log(f"Found email from research: {target_email}", "success")
-    
+
     if not target_email:
         log("No email address found or provided", "error")
-        client.update_status(task_id, "failed", 
-                           error_message="Could not find email address. Please provide one.",
-                           company_research=extracted)
+        client.update_status(task_id, "failed",
+                             error_message="Could not find email address. Please provide one.",
+                             company_research=research["raw"])
         return
-    
-    # Store research
-    client.update_status(task_id, "running", company_research=extracted)
+
+    client.update_status(task_id, "running", company_research=research["raw"])
     
     # =========================================================================
-    # STEP 4: Draft personalized email
+    # STEP 3: Draft personalized email
     # =========================================================================
-    log("Step 4: Drafting email...", "info")
-    
-    # Check if low confidence — should we ask for clarification?
+    log("Step 3: Drafting email...", "info")
+
     if confidence.lower() == "low":
         log("⚠️ Low confidence in research results", "info")
     
@@ -346,9 +459,9 @@ Best regards,
     log(f"Full email composed", "success")
     
     # =========================================================================
-    # STEP 5: Submit for approval
+    # STEP 4: Submit for approval
     # =========================================================================
-    log("Step 5: Submitting for your approval...", "info")
+    log("Step 4: Submitting for your approval...", "info")
     
     client.update_status(
         task_id, 
@@ -361,7 +474,7 @@ Best regards,
     log("📧 Email draft ready — check the website to approve or cancel", "success")
     
     # =========================================================================
-    # STEP 6: Wait for confirmation
+    # STEP 5: Wait for confirmation
     # =========================================================================
     log("Waiting for your confirmation...", "info")
     
@@ -397,9 +510,9 @@ Best regards,
         return
     
     # =========================================================================
-    # STEP 7: Send the email
+    # STEP 6: Send the email
     # =========================================================================
-    log("Step 7: Sending email via Gmail...", "info")
+    log("Step 6: Sending email via Gmail...", "info")
     log(f"🔧 send_email(to={target_email}, subject={subject_line})", "tool_call")
     
     try:
