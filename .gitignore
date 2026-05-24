@@ -1,0 +1,27 @@
+# Environment — contains real secrets, never commit
+.env
+
+# Google OAuth tokens and credentials
+workspace/token.pickle
+workspace/credentials.json
+
+# Database — contains API key hashes and task history
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
