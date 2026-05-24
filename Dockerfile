@@ -13,9 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY agent_worker.py .
 COPY router.py .
-COPY workflows.py .
+COPY core.py .
 COPY tools_web.py .
 COPY tools_google.py .
+COPY workflows/ ./workflows/
 
 # Create workspace directory
 RUN mkdir -p /workspace

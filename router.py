@@ -1,80 +1,151 @@
 # =============================================================================
-# router.py — Intent Classification and Workflow Dispatch
+# router.py — Dynamic Workflow Discovery and Dispatch
 # =============================================================================
-# Reads the user's input, classifies it into a workflow type, and dispatches
-# to the appropriate workflow function.
+# Scans the workflows/ directory on every task, builds a live registry,
+# asks the LLM to pick the right workflow, and runs it.
 #
 # Adding a new workflow:
-#   1. Write the workflow function in workflows.py
-#   2. Import it here
-#   3. Add its type to the classify_intent prompt and the dispatch block below
+#   1. Create a .py file in the workflows/ directory
+#   2. Define WORKFLOW_META = {"name": "...", "description": "..."}
+#   3. Define run(task_id, input_text, client) -> None
+#   That's it — no changes needed here.
 # =============================================================================
 
-from workflows import business_intro_workflow, calendar_booking_workflow, wait_for_input, llm_call
+import os
+import sys
+import importlib.util
 
-WORKFLOW_TYPES = ["email_outreach", "calendar_booking"]
+from core import llm_call, wait_for_input
 
-def classify_intent(input_text: str) -> str:
-    """Use LLM to classify the request into a workflow type."""
-    prompt = f"""Classify this task request into exactly one of these workflow types:
+WORKFLOWS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflows")
 
-- email_outreach: research a company or person and send or draft an outreach or introduction email
-- calendar_booking: schedule, add, check, or modify a calendar appointment or event
-- unknown: anything that doesn't clearly fit the above
+# Ensure the app root is importable so workflow files can do `from core import ...`
+_app_root = os.path.dirname(os.path.abspath(__file__))
+if _app_root not in sys.path:
+    sys.path.insert(0, _app_root)
+
+
+def load_workflows() -> dict:
+    """
+    Scan workflows/ and import every valid .py file.
+    A valid workflow file must expose:
+        WORKFLOW_META: dict  — must have "name" and "description" keys
+        run(task_id, input_text, client) -> None
+
+    Reloads on every call so newly dropped files are picked up without restart.
+    """
+    registry: dict = {}
+
+    if not os.path.isdir(WORKFLOWS_DIR):
+        return registry
+
+    for fname in sorted(os.listdir(WORKFLOWS_DIR)):
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+
+        path = os.path.join(WORKFLOWS_DIR, fname)
+        spec = importlib.util.spec_from_file_location(fname[:-3], path)
+        mod  = importlib.util.module_from_spec(spec)
+
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            print(f"⚠️  Failed to load workflow '{fname}': {e}")
+            continue
+
+        meta = getattr(mod, "WORKFLOW_META", None)
+        run  = getattr(mod, "run", None)
+
+        if not (meta and isinstance(meta, dict) and "name" in meta and "description" in meta):
+            print(f"⚠️  Skipping '{fname}': missing or invalid WORKFLOW_META")
+            continue
+
+        if not callable(run):
+            print(f"⚠️  Skipping '{fname}': no callable run() function")
+            continue
+
+        registry[meta["name"]] = {"meta": meta, "run": run}
+
+    return registry
+
+
+def classify_intent(input_text: str, registry: dict) -> str:
+    """
+    Show the LLM the full description of every available workflow and ask it to pick one.
+    Returns the workflow name, or "unknown" if none fit.
+    """
+    workflow_list = "\n".join(
+        f'- "{name}": {info["meta"]["description"]}'
+        for name, info in registry.items()
+    )
+
+    prompt = f"""Choose the best workflow to handle this request.
+
+Available workflows:
+{workflow_list}
+- "unknown": none of the above fit
 
 Request: "{input_text}"
 
-Respond with ONLY the workflow type (one of: email_outreach, calendar_booking, unknown):"""
+Reply with ONLY the workflow name (e.g. business_intro) or "unknown":"""
 
-    result = llm_call(prompt).strip().lower()
+    result = llm_call(prompt).strip().lower().strip('"').strip("'")
 
-    for wf in WORKFLOW_TYPES:
-        if wf in result:
-            return wf
+    for name in registry:
+        if name in result:
+            return name
     return "unknown"
 
 
-def route_workflow(task_id: str, input_text: str, client, _depth: int = 0):
+def route_workflow(task_id: str, input_text: str, client, _depth: int = 0) -> None:
     """
-    Classify intent and dispatch to the correct workflow.
-    On unknown intent, asks the user to clarify (one level deep).
+    Load the workflow registry, classify the request, and dispatch.
+    On unknown intent, asks the user for clarification (one retry).
     """
 
     def log(msg: str, log_type: str = "info"):
         print(f"  [{log_type.upper()}] {msg}")
         client.log(task_id, msg, log_type)
 
-    log("🔀 Classifying intent...", "info")
-    workflow_type = classify_intent(input_text)
-    log(f"Detected: {workflow_type}", "agent")
+    registry = load_workflows()
 
-    if workflow_type == "email_outreach":
-        log("📧 Starting email outreach workflow", "info")
-        business_intro_workflow(task_id, input_text, client)
+    if not registry:
+        log("No workflows found in workflows/ directory", "error")
+        client.update_status(task_id, "failed",
+                             error_message="No workflows are installed. Add .py files to the workflows/ directory.")
+        return
 
-    elif workflow_type == "calendar_booking":
-        log("📅 Starting calendar booking workflow", "info")
-        calendar_booking_workflow(task_id, input_text, client)
+    log(f"🔀 {len(registry)} workflow(s) loaded: {', '.join(registry)}", "info")
 
-    else:
-        if _depth > 0:
-            log("Still couldn't determine intent after clarification", "error")
-            client.update_status(task_id, "failed",
-                                 error_message="Could not determine what to do. Please try again with more detail.")
-            return
+    workflow_name = classify_intent(input_text, registry)
+    log(f"Routing to: {workflow_name}", "agent")
 
-        log("❓ Intent unclear — asking for clarification", "info")
-        answer = wait_for_input(
-            task_id,
-            "I'm not sure what you'd like me to do. "
-            "Are you looking to (1) send an outreach email to a company, "
-            "or (2) book a calendar appointment?",
-            client
+    if workflow_name in registry:
+        log(f"▶ Running: {workflow_name}", "info")
+        registry[workflow_name]["run"](task_id, input_text, client)
+        return
+
+    # Unknown intent — ask for clarification (once)
+    if _depth > 0:
+        log("Still couldn't determine intent after clarification", "error")
+        client.update_status(
+            task_id, "failed",
+            error_message="Could not determine what to do. Please try again with more detail.",
         )
+        return
 
-        if not answer:
-            return
+    available = ", ".join(f'"{n}"' for n in registry)
+    log("❓ Intent unclear — asking for clarification", "info")
 
-        # Re-route once with the clarification appended
-        combined = f"{input_text} — clarification: {answer}"
-        route_workflow(task_id, combined, client, _depth=1)
+    answer = wait_for_input(
+        task_id,
+        f"I'm not sure which workflow to use. "
+        f"Available: {available}. "
+        f"What would you like me to do?",
+        client,
+    )
+
+    if not answer:
+        return
+
+    route_workflow(task_id, f"{input_text} — clarification: {answer}", client, _depth=1)
