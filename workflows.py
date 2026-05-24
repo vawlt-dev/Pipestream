@@ -56,6 +56,13 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
     until the user submits an answer via the web UI. Returns the answer string,
     or None on timeout or cancellation.
     """
+    # Check trust flag before asking — skip the question entirely if trusted
+    task = client.get_task(task_id)
+    if task and task.get("trusted"):
+        client.log(task_id, f"💬 (trusted) Skipping: {question}", "info")
+        client.log(task_id, "✅ Proceeding autonomously", "success")
+        return "yes"
+
     client.update_status(task_id, "awaiting_input", pending_question=question, user_input="")
     client.log(task_id, f"💬 {question}", "info")
 
@@ -67,6 +74,11 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
         task = client.get_task(task_id)
         if not task:
             return None
+
+        # Trust may have been granted while we were waiting
+        if task.get("trusted") and task.get("status") == "running":
+            client.log(task_id, "✅ Trust granted — proceeding autonomously", "success")
+            return "yes"
 
         status = task.get("status")
 
