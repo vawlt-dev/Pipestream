@@ -48,6 +48,41 @@ def llm_call(prompt: str) -> str:
     response = llm.invoke(prompt)
     return response.content
 
+def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> str | None:
+    """
+    Post a question to the user and wait for their reply.
+
+    Sets status to awaiting_input, clears any previous user_input, then polls
+    until the user submits an answer via the web UI. Returns the answer string,
+    or None on timeout or cancellation.
+    """
+    client.update_status(task_id, "awaiting_input", pending_question=question, user_input="")
+    client.log(task_id, f"💬 {question}", "info")
+
+    waited = 0
+    while waited < timeout:
+        time.sleep(5)
+        waited += 5
+
+        task = client.get_task(task_id)
+        if not task:
+            return None
+
+        status = task.get("status")
+
+        if status == "running":
+            answer = task.get("user_input", "")
+            if answer:
+                client.log(task_id, f"💬 You replied: {answer}", "info")
+                return answer
+
+        if status in ("cancelled", "failed"):
+            return None
+
+    client.log(task_id, "⏰ Timed out waiting for reply", "error")
+    client.update_status(task_id, "failed", error_message="Timed out waiting for user reply")
+    return None
+
 # =============================================================================
 # BUSINESS INTRO WORKFLOW
 # =============================================================================
