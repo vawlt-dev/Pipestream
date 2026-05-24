@@ -20,11 +20,12 @@ import os
 import re
 import time
 import json
-from datetime import datetime
+import dateparser
+from datetime import datetime, timedelta
 
 from langchain_openai import ChatOpenAI
 from tools_web import web_search, scrape_url
-from tools_google import send_email
+from tools_google import send_email, create_calendar_event
 
 # Sender identity — set these in .env
 SENDER_NAME    = os.getenv("SENDER_NAME", "")
@@ -94,6 +95,29 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
     client.log(task_id, "⏰ Timed out waiting for reply", "error")
     client.update_status(task_id, "failed", error_message="Timed out waiting for user reply")
     return None
+
+# =============================================================================
+# SHARED HELPERS
+# =============================================================================
+
+def extract_field(text: str, field: str) -> str:
+    """Pull a labelled field from LLM-structured output."""
+    match = re.search(rf"{field}:\s*(.+)", text, re.IGNORECASE)
+    return match.group(1).strip() if match else "not found"
+
+def parse_duration(duration_str: str) -> int:
+    """Convert a duration string to minutes. Defaults to 60."""
+    if not duration_str or duration_str.lower() in ("not specified", "not found"):
+        return 60
+    s = duration_str.lower()
+    hours = re.search(r'(\d+(?:\.\d+)?)\s*h', s)
+    mins  = re.search(r'(\d+)\s*m', s)
+    total = 0
+    if hours:
+        total += int(float(hours.group(1)) * 60)
+    if mins:
+        total += int(mins.group(1))
+    return total if total > 0 else 60
 
 # =============================================================================
 # BUSINESS INTRO WORKFLOW
@@ -222,11 +246,6 @@ CONFIDENCE: <high/medium/low>"""
 
     extracted = llm_call(extract_prompt)
     log(f"Extracted info:\n{extracted}", "agent")
-    
-    # Parse the extraction
-    def extract_field(text: str, field: str) -> str:
-        match = re.search(rf"{field}:\s*(.+)", text, re.IGNORECASE)
-        return match.group(1).strip() if match else "not found"
     
     company_summary = extract_field(extracted, "COMPANY_SUMMARY")
     recent_news = extract_field(extracted, "RECENT_NEWS")
@@ -389,3 +408,162 @@ Best regards,
     except Exception as e:
         log(f"Failed to send email: {e}", "error")
         client.update_status(task_id, "failed", error_message=str(e))
+
+# =============================================================================
+# CALENDAR BOOKING WORKFLOW
+# =============================================================================
+
+def calendar_booking_workflow(task_id: str, input_text: str, client):
+    """
+    Conversational calendar booking.
+    Parses the request, resolves the date, confirms with user, creates event.
+    Retries up to 3 times if the user provides corrections.
+    """
+
+    TIMEZONE = os.getenv("TIMEZONE", "Pacific/Auckland")
+    MAX_RETRIES = 3
+
+    def log(msg: str, log_type: str = "info"):
+        print(f"  [{log_type.upper()}] {msg}")
+        client.log(task_id, msg, log_type)
+
+    log("📅 Starting calendar booking workflow", "info")
+
+    original_input = input_text
+    dt = None
+    event_name = "Appointment"
+    duration_mins = 60
+    location = ""
+    formatted_dt = ""
+
+    for attempt in range(MAX_RETRIES):
+
+        # =====================================================================
+        # STEP 1: Parse booking details
+        # =====================================================================
+        log(f"Step 1: Parsing booking details (attempt {attempt + 1})...", "info")
+
+        parse_prompt = f"""Extract booking details from this request.
+
+Request: "{input_text}"
+
+Respond in this exact format:
+EVENT_NAME: <name of the event or appointment>
+DATE_TIME: <date and time exactly as stated, e.g. "next Monday at 3pm">
+DURATION: <duration if stated, e.g. "1 hour", "30 minutes", or "not specified">
+LOCATION: <location if stated, or "not specified">
+
+Now parse the request:"""
+
+        parsed = llm_call(parse_prompt)
+        log(f"Parsed: {parsed}", "agent")
+
+        event_name    = extract_field(parsed, "EVENT_NAME")
+        date_time_text = extract_field(parsed, "DATE_TIME")
+        duration_str  = extract_field(parsed, "DURATION")
+        location_str  = extract_field(parsed, "LOCATION")
+
+        if event_name.lower() == "not found":
+            event_name = "Appointment"
+        location = "" if location_str.lower() in ("not found", "not specified") else location_str
+        duration_mins = parse_duration(duration_str)
+
+        # =====================================================================
+        # STEP 2: Resolve natural language date to absolute datetime
+        # =====================================================================
+        log(f"Step 2: Resolving date — '{date_time_text}'", "info")
+
+        dt = dateparser.parse(
+            date_time_text,
+            settings={
+                'PREFER_DATES_FROM': 'future',
+                'TIMEZONE': TIMEZONE,
+                'RETURN_AS_TIMEZONE_AWARE': False,
+            }
+        )
+
+        if not dt:
+            log(f"Could not parse date: {date_time_text}", "error")
+            answer = wait_for_input(
+                task_id,
+                f"I couldn't understand the date \"{date_time_text}\". "
+                f"When would you like to schedule \"{event_name}\"? "
+                f"(e.g. \"next Monday at 3pm\")",
+                client
+            )
+            if not answer:
+                return
+            input_text = f"{original_input} — date clarification: {answer}"
+            continue
+
+        log(f"Resolved: {dt.strftime('%A %d %B %Y at %H:%M')}", "info")
+
+        # =====================================================================
+        # STEP 3: Confirm with user
+        # =====================================================================
+        day_str  = dt.strftime("%A %d %B").lstrip("0")
+        time_str = dt.strftime("%I:%M %p").lstrip("0")
+        formatted_dt = f"{day_str} at {time_str}"
+
+        if duration_mins >= 60 and duration_mins % 60 == 0:
+            hrs = duration_mins // 60
+            duration_label = f"{hrs} hr{'s' if hrs > 1 else ''}"
+        else:
+            duration_label = f"{duration_mins} min"
+
+        confirm_q = f'Book "{event_name}" — {formatted_dt} ({duration_label})'
+        if location:
+            confirm_q += f" at {location}"
+        confirm_q += "?"
+
+        answer = wait_for_input(task_id, confirm_q, client)
+        if not answer:
+            return
+
+        # =====================================================================
+        # STEP 4: Check if confirmed or a correction
+        # =====================================================================
+        is_yes_prompt = f'Is this response a "yes" or confirmation?\nResponse: "{answer}"\nReply with only YES or NO:'
+        is_confirmed = "YES" in llm_call(is_yes_prompt).upper()
+
+        if is_confirmed:
+            log("✅ Confirmed — creating event", "success")
+            break
+
+        log(f"Got correction: {answer}", "info")
+        log("Re-parsing with correction...", "info")
+        input_text = f"{original_input} — correction: {answer}"
+
+    else:
+        log("Could not confirm booking after multiple attempts", "error")
+        client.update_status(
+            task_id, "failed",
+            error_message="Could not confirm booking details. Please try again with more detail."
+        )
+        return
+
+    # =========================================================================
+    # STEP 5: Create the calendar event
+    # =========================================================================
+    log("Step 5: Creating calendar event...", "info")
+
+    dt_end = dt + timedelta(minutes=duration_mins)
+    log(f"🔧 create_calendar_event({event_name}, {dt.isoformat()}, {dt_end.isoformat()})", "tool_call")
+
+    result = create_calendar_event(
+        summary=event_name,
+        start_time=dt.isoformat(),
+        end_time=dt_end.isoformat(),
+        description="Booked via Pipestream",
+        location=location
+    )
+
+    log(f"📤 {result}", "tool_result")
+
+    if "✅" in result:
+        log("🎉 Event created successfully!", "success")
+        client.update_status(task_id, "completed",
+                             result=f'"{event_name}" booked for {formatted_dt}')
+    else:
+        log(f"Failed to create event: {result}", "error")
+        client.update_status(task_id, "failed", error_message=result)

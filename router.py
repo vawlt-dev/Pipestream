@@ -10,7 +10,7 @@
 #   3. Add its type to the classify_intent prompt and the dispatch block below
 # =============================================================================
 
-from workflows import business_intro_workflow, wait_for_input, llm_call
+from workflows import business_intro_workflow, calendar_booking_workflow, wait_for_input, llm_call
 
 WORKFLOW_TYPES = ["email_outreach", "calendar_booking"]
 
@@ -53,10 +53,8 @@ def route_workflow(task_id: str, input_text: str, client, _depth: int = 0):
         business_intro_workflow(task_id, input_text, client)
 
     elif workflow_type == "calendar_booking":
-        # Placeholder until Phase 3
-        log("📅 Calendar booking workflow coming in Phase 3", "info")
-        client.update_status(task_id, "failed",
-                             error_message="Calendar booking not yet implemented — coming soon")
+        log("📅 Starting calendar booking workflow", "info")
+        calendar_booking_workflow(task_id, input_text, client)
 
     else:
         if _depth > 0:
