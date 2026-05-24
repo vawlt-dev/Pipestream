@@ -98,9 +98,10 @@ def get_emails(max_results: int = 500) -> list[dict]:
         snippet, is_starred, is_important, is_unread, is_automated,
         internal_date (ms unix timestamp, use for sorting)
     """
-    creds   = get_google_credentials()
-    service = build('gmail', 'v1', credentials=creds)
+    creds = get_google_credentials()
 
+    # Use a single service to list message IDs (just one call)
+    service  = build('gmail', 'v1', credentials=creds)
     response = service.users().messages().list(
         userId='me',
         maxResults=max_results,
@@ -111,8 +112,10 @@ def get_emails(max_results: int = 500) -> list[dict]:
     if not stubs:
         return []
 
+    # Each thread builds its own service instance to avoid shared-state issues
     def fetch_meta(stub):
-        detail  = service.users().messages().get(
+        svc    = build('gmail', 'v1', credentials=creds)
+        detail = svc.users().messages().get(
             userId='me',
             id=stub['id'],
             format='metadata',
@@ -136,9 +139,9 @@ def get_emails(max_results: int = 500) -> list[dict]:
         }
 
     results = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fetch_meta, s) for s in stubs]
-        for future in as_completed(futures):
+        for future in as_completed(futures, timeout=120):
             try:
                 results.append(future.result())
             except Exception:
