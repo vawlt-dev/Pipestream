@@ -125,43 +125,101 @@ def parse_duration(duration_str: str) -> int:
     return total if total > 0 else 60
 
 # =============================================================================
-# DEEP RESEARCH
+# INFORMATION GATHERING
 # =============================================================================
 
-def deep_research(company_name: str, task_id: str, client, log) -> dict:
-    """
-    Multi-round recursive research:
-      1. Discovery searches → collect URLs
-      2. LLM selects best URLs to scrape
-      3. Scrape selected pages
-      4. LLM evaluates gaps → issues targeted follow-up searches
-      5. Scrape follow-up URLs if budget allows
-      6. Final structured extraction
+# Shown verbatim to the LLM when it selects a depth — keep descriptions honest.
+RESEARCH_DEPTHS = {
+    "light": (
+        "1 web search, snippet text only, no page scraping. "
+        "Fast (~10s). Good for well-known subjects where a quick overview is enough."
+    ),
+    "medium": (
+        "3 web searches (general, recent news, contact/people), snippet text only. "
+        "~30s. Good for most subjects — solid coverage without spending time scraping."
+    ),
+    "deep": (
+        "3 discovery searches + LLM picks best URLs to scrape (up to 4 full pages) + "
+        "gap-analysis round that issues up to 2 targeted follow-up searches + more scraping. "
+        "~2-3 min. Best for obscure subjects, small companies, or when high accuracy is critical."
+    ),
+}
 
-    Returns dict: company_summary, recent_news, key_person, contact_email,
-                  confidence, raw (extracted text), all_content (full corpus).
-    Returns empty dict if task is cancelled mid-research.
+def select_research_depth(topic: str, context: str = "") -> str:
     """
-    MAX_SCRAPES = 4
+    Ask the LLM to pick light / medium / deep given what it knows about the topic.
+    The LLM sees the full description of each level before choosing.
+    """
+    depth_menu = "\n".join(
+        f'  "{key}": {desc}' for key, desc in RESEARCH_DEPTHS.items()
+    )
+    prompt = f"""You need to research "{topic}" for an automated task.
 
+Available research depths (read carefully before choosing):
+{depth_menu}
+
+Task context: {context or "none"}
+
+Which depth is most appropriate? Consider whether the subject is well-known or obscure, and how much accuracy matters for this task.
+
+Reply with ONLY one word — light, medium, or deep:"""
+
+    result = llm_call(prompt).strip().lower()
+    for key in RESEARCH_DEPTHS:
+        if key in result:
+            return key
+    return "medium"
+
+
+def gather_info(topic: str, depth: str, task_id: str, client, log) -> dict:
+    """
+    Generic information gathering at a specified depth.
+
+    topic   — anything: a company, person, technology, concept, etc.
+    depth   — "light", "medium", or "deep" (see RESEARCH_DEPTHS for specs)
+
+    Returns:
+        summary       — 1-2 sentence overview
+        key_facts     — notable facts / recent news / milestones
+        key_people    — names and roles of notable people found
+        contact_info  — any contact email or URL found
+        confidence    — high / medium / low
+        raw           — raw LLM extraction text
+        corpus        — full gathered text (snippets + scraped pages)
+
+    Returns empty dict if the task is cancelled mid-run.
+    """
+    """
+    Returns empty dict if the task is cancelled mid-run.
+    """
     all_snippets: list[str] = []
     all_scraped:  list[str] = []
     scrape_count  = 0
+    MAX_SCRAPES   = 4
+
+    log(f"🔬 Research depth: {depth}", "info")
 
     # -------------------------------------------------------------------------
-    # Round 1 — Discovery searches
+    # Build search queries based on depth
     # -------------------------------------------------------------------------
-    log("🔬 Round 1: Discovery searches", "info")
-
-    discovery_queries = [
-        f"{company_name} New Zealand",
-        f"{company_name} about leadership team",
-        f"{company_name} contact email",
-    ]
+    if depth == "light":
+        queries = [f"{topic}"]
+    elif depth == "medium":
+        queries = [
+            f"{topic}",
+            f"{topic} news recent",
+            f"{topic} contact people",
+        ]
+    else:  # deep
+        queries = [
+            f"{topic}",
+            f"{topic} about leadership team",
+            f"{topic} contact email",
+        ]
 
     candidate_urls: list[str] = []
 
-    for query in discovery_queries:
+    for query in queries:
         log(f"🔍 {query}", "tool_call")
         result = web_search(query, max_results=5)
         all_snippets.append(f"Search: {query}\n{result}")
@@ -172,12 +230,13 @@ def deep_research(company_name: str, task_id: str, client, log) -> dict:
             return {}
 
     # -------------------------------------------------------------------------
-    # LLM picks best URLs to scrape
+    # Deep only: LLM picks best URLs → scrape → gap analysis → follow-ups
     # -------------------------------------------------------------------------
-    unique_urls = list(dict.fromkeys(candidate_urls))[:15]
-    url_list = "\n".join(f"- {u}" for u in unique_urls)
+    if depth == "deep":
+        unique_urls = list(dict.fromkeys(candidate_urls))[:15]
+        url_list    = "\n".join(f"- {u}" for u in unique_urls)
 
-    select_prompt = f"""From these URLs found while researching "{company_name}", select up to 3 that are most likely to contain rich information (company website, About/Team page, news article, contact page). Prefer official company domains.
+        select_prompt = f"""From these URLs found while researching "{topic}", select up to 3 most likely to contain rich information (official site, About/Team page, news article, contact page). Prefer official domains.
 
 URLs:
 {url_list}
@@ -185,115 +244,102 @@ URLs:
 Reply with ONLY a JSON array of up to 3 URLs:
 ["https://...", "https://..."]"""
 
-    try:
-        selected_raw = llm_call(select_prompt)
-        json_match = re.search(r'\[.*?\]', selected_raw, re.DOTALL)
-        selected_urls: list[str] = json.loads(json_match.group())[:3] if json_match else unique_urls[:3]
-    except Exception:
-        selected_urls = unique_urls[:3]
+        try:
+            selected_raw  = llm_call(select_prompt)
+            json_match    = re.search(r'\[.*?\]', selected_raw, re.DOTALL)
+            selected_urls: list[str] = json.loads(json_match.group())[:3] if json_match else unique_urls[:3]
+        except Exception:
+            selected_urls = unique_urls[:3]
 
-    # -------------------------------------------------------------------------
-    # Scrape selected URLs
-    # -------------------------------------------------------------------------
-    for url in selected_urls:
-        if scrape_count >= MAX_SCRAPES:
-            break
-        log(f"🌐 Scraping: {url}", "tool_call")
-        content = scrape_url(url, max_chars=4000)
-        all_scraped.append(f"FROM {url}:\n{content}")
-        scrape_count += 1
-        log(f"Got {len(content)} chars", "tool_result")
-        if check_cancelled(task_id, client):
-            return {}
+        for url in selected_urls:
+            if scrape_count >= MAX_SCRAPES:
+                break
+            log(f"🌐 Scraping: {url}", "tool_call")
+            content = scrape_url(url, max_chars=4000)
+            all_scraped.append(f"FROM {url}:\n{content}")
+            scrape_count += 1
+            log(f"Got {len(content)} chars", "tool_result")
+            if check_cancelled(task_id, client):
+                return {}
 
-    # -------------------------------------------------------------------------
-    # Round 2 — LLM evaluates gaps, issues follow-up searches
-    # -------------------------------------------------------------------------
-    log("🔬 Round 2: Evaluating research gaps", "info")
+        # Gap analysis
+        log("🔬 Evaluating research gaps", "info")
+        combined = "\n\n---\n\n".join(all_snippets + all_scraped)
 
-    combined = "\n\n---\n\n".join(all_snippets + all_scraped)
-
-    evaluate_prompt = f"""You are researching "{company_name}" to write a personalized intro email. Evaluate what you know and what's still missing.
+        evaluate_prompt = f"""You are gathering information about "{topic}". Evaluate what you know and what's still missing.
 
 Research so far:
 {combined[:10000]}
 
-Respond in this exact format:
 CONFIDENCE: <high/medium/low>
-WHAT_WE_KNOW: <one sentence summary of what is clear>
-MISSING: <what is still unknown, e.g. "key person name", "recent news", "contact email", or "nothing">
-FOLLOW_UP_SEARCHES: <up to 2 specific search queries to fill the gaps, comma-separated, or "none">"""
+MISSING: <what is still unclear, or "nothing">
+FOLLOW_UP_SEARCHES: <up to 2 specific queries to fill gaps, comma-separated, or "none">"""
 
-    evaluation = llm_call(evaluate_prompt)
-    log(f"Gap analysis:\n{evaluation}", "agent")
-    if check_cancelled(task_id, client):
-        return {}
+        evaluation    = llm_call(evaluate_prompt)
+        log(f"Gap analysis:\n{evaluation}", "agent")
+        if check_cancelled(task_id, client):
+            return {}
 
-    confidence    = extract_field(evaluation, "CONFIDENCE")
-    follow_up_raw = extract_field(evaluation, "FOLLOW_UP_SEARCHES")
+        confidence    = extract_field(evaluation, "CONFIDENCE")
+        follow_up_raw = extract_field(evaluation, "FOLLOW_UP_SEARCHES")
 
-    # -------------------------------------------------------------------------
-    # Follow-up searches (only if confidence isn't already high)
-    # -------------------------------------------------------------------------
-    if confidence.lower() != "high" and follow_up_raw.lower() not in ("none", "not found", ""):
-        follow_up_queries = [
-            q.strip().strip('"').strip("'")
-            for q in re.split(r',|\n', follow_up_raw)
-            if q.strip() and q.strip().lower() not in ("none", "not found")
-        ][:2]
+        if confidence.lower() != "high" and follow_up_raw.lower() not in ("none", "not found", ""):
+            follow_up_queries = [
+                q.strip().strip('"').strip("'")
+                for q in re.split(r',|\n', follow_up_raw)
+                if q.strip() and q.strip().lower() not in ("none", "not found")
+            ][:2]
 
-        for query in follow_up_queries:
-            log(f"🔍 Follow-up: {query}", "tool_call")
-            result = web_search(query, max_results=4)
-            all_snippets.append(f"Follow-up search: {query}\n{result}")
-            log(f"Got {len(result)} chars", "tool_result")
-            if check_cancelled(task_id, client):
-                return {}
+            for query in follow_up_queries:
+                log(f"🔍 Follow-up: {query}", "tool_call")
+                result = web_search(query, max_results=4)
+                all_snippets.append(f"Follow-up: {query}\n{result}")
+                log(f"Got {len(result)} chars", "tool_result")
+                if check_cancelled(task_id, client):
+                    return {}
 
-            # Scrape the top URL from each follow-up if budget allows
-            if scrape_count < MAX_SCRAPES:
-                follow_urls = re.findall(r'^(https?://\S+)', result, re.MULTILINE)
-                if follow_urls:
-                    url = follow_urls[0]
-                    log(f"🌐 Scraping follow-up: {url}", "tool_call")
-                    content = scrape_url(url, max_chars=3000)
-                    all_scraped.append(f"FROM {url}:\n{content}")
-                    scrape_count += 1
-                    log(f"Got {len(content)} chars", "tool_result")
-                    if check_cancelled(task_id, client):
-                        return {}
+                if scrape_count < MAX_SCRAPES:
+                    follow_urls = re.findall(r'^(https?://\S+)', result, re.MULTILINE)
+                    if follow_urls:
+                        log(f"🌐 Scraping follow-up: {follow_urls[0]}", "tool_call")
+                        content = scrape_url(follow_urls[0], max_chars=3000)
+                        all_scraped.append(f"FROM {follow_urls[0]}:\n{content}")
+                        scrape_count += 1
+                        log(f"Got {len(content)} chars", "tool_result")
+                        if check_cancelled(task_id, client):
+                            return {}
 
     # -------------------------------------------------------------------------
-    # Final structured extraction
+    # Final extraction — generic fields any workflow can use
     # -------------------------------------------------------------------------
-    log("📋 Final extraction pass", "info")
+    log("📋 Extracting structured info", "info")
 
-    all_content = "\n\n---\n\n".join(all_snippets + all_scraped)
+    corpus = "\n\n---\n\n".join(all_snippets + all_scraped)
 
-    extract_prompt = f"""Based on all this research about "{company_name}", extract the following fields precisely.
+    extract_prompt = f"""Based on this research about "{topic}", extract:
 
-COMPANY_SUMMARY: What does this company do? (1-2 sentences)
-RECENT_NEWS: Any recent news, achievements, funding, or milestones? (1 sentence, or "none found")
-KEY_PERSON: Name and title of the most senior person found (CEO, founder, director)? (or "not found")
-CONTACT_EMAIL: Any contact email address? (or "not found")
-CONFIDENCE: Overall confidence in accuracy of the above (high/medium/low)
+SUMMARY: What is this about? (1-2 sentences)
+KEY_FACTS: Notable facts, recent news, or milestones (1-2 sentences, or "none found")
+KEY_PEOPLE: Notable people and their roles (or "none found")
+CONTACT_INFO: Any contact email or URL (or "none found")
+CONFIDENCE: Overall confidence in accuracy (high/medium/low)
 
 Research:
-{all_content[:12000]}
+{corpus[:12000]}
 
 Respond in the exact format above:"""
 
     extracted = llm_call(extract_prompt)
-    log(f"Research complete:\n{extracted}", "agent")
+    log(f"Info gathered:\n{extracted}", "agent")
 
     return {
-        "company_summary": extract_field(extracted, "COMPANY_SUMMARY"),
-        "recent_news":     extract_field(extracted, "RECENT_NEWS"),
-        "key_person":      extract_field(extracted, "KEY_PERSON"),
-        "contact_email":   extract_field(extracted, "CONTACT_EMAIL"),
-        "confidence":      extract_field(extracted, "CONFIDENCE"),
-        "raw":             extracted,
-        "all_content":     all_content,
+        "summary":      extract_field(extracted, "SUMMARY"),
+        "key_facts":    extract_field(extracted, "KEY_FACTS"),
+        "key_people":   extract_field(extracted, "KEY_PEOPLE"),
+        "contact_info": extract_field(extracted, "CONTACT_INFO"),
+        "confidence":   extract_field(extracted, "CONFIDENCE"),
+        "raw":          extracted,
+        "corpus":       corpus,
     }
 
 # =============================================================================
@@ -363,34 +409,39 @@ Now parse the request:"""
     client.update_status(task_id, "running", company_name=company_name)
 
     # =========================================================================
-    # STEP 2: Deep recursive research
+    # STEP 2: Gather information
     # =========================================================================
-    log("Step 2: Starting deep research...", "info")
+    depth = select_research_depth(
+        company_name,
+        context=f"Writing a personalized intro email to {company_name}. Task: {input_text}"
+    )
+    log(f"Step 2: Gathering info (depth: {depth})...", "info")
 
-    research = deep_research(company_name, task_id, client, log)
-    if not research:
+    info = gather_info(company_name, depth, task_id, client, log)
+    if not info:
         return  # cancelled mid-research
 
-    company_summary = research["company_summary"]
-    recent_news     = research["recent_news"]
-    key_person      = research["key_person"]
-    found_email     = research["contact_email"]
-    confidence      = research["confidence"]
+    company_summary = info["summary"]
+    recent_news     = info["key_facts"]
+    key_person      = info["key_people"]
+    found_email     = info["contact_info"]
+    confidence      = info["confidence"]
 
-    # Use found email if we didn't have one
-    if not target_email and found_email and found_email.lower() != "not found":
-        if "@" in found_email:
-            target_email = found_email
+    # Extract email from contact_info if not already provided
+    if not target_email and found_email and found_email.lower() != "none found":
+        email_match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', found_email)
+        if email_match:
+            target_email = email_match.group()
             log(f"Found email from research: {target_email}", "success")
 
     if not target_email:
         log("No email address found or provided", "error")
         client.update_status(task_id, "failed",
                              error_message="Could not find email address. Please provide one.",
-                             company_research=research["raw"])
+                             company_research=info["raw"])
         return
 
-    client.update_status(task_id, "running", company_research=research["raw"])
+    client.update_status(task_id, "running", company_research=info["raw"])
     
     # =========================================================================
     # STEP 3: Draft personalized email
