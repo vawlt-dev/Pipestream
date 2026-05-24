@@ -100,6 +100,11 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
 # SHARED HELPERS
 # =============================================================================
 
+def check_cancelled(task_id: str, client) -> bool:
+    """Returns True if the task has been cancelled externally."""
+    task = client.get_task(task_id)
+    return bool(task and task.get("status") in ("cancelled", "failed"))
+
 def extract_field(text: str, field: str) -> str:
     """Pull a labelled field from LLM-structured output."""
     match = re.search(rf"{field}:\s*(.+)", text, re.IGNORECASE)
@@ -199,25 +204,29 @@ Now parse the request:"""
     result1 = web_search(f"{company_name} New Zealand")
     research_results.append(f"General search:\n{result1}")
     log(f"Found {len(result1)} chars of results", "tool_result")
-    
+    if check_cancelled(task_id, client): return
+
     # Search 2: Recent news
     log(f"🔍 Searching: {company_name} news recent", "tool_call")
     result2 = web_search(f"{company_name} news recent")
     research_results.append(f"News search:\n{result2}")
     log(f"Found {len(result2)} chars of results", "tool_result")
-    
+    if check_cancelled(task_id, client): return
+
     # Search 3: Key people / leadership
     log(f"🔍 Searching: {company_name} CEO founder leadership", "tool_call")
     result3 = web_search(f"{company_name} CEO founder leadership team")
     research_results.append(f"Leadership search:\n{result3}")
     log(f"Found {len(result3)} chars of results", "tool_result")
-    
+    if check_cancelled(task_id, client): return
+
     # If no email provided, try to find one
     if not target_email:
         log(f"🔍 Searching: {company_name} contact email", "tool_call")
         result4 = web_search(f"{company_name} contact email")
         research_results.append(f"Contact search:\n{result4}")
         log(f"Found {len(result4)} chars of results", "tool_result")
+        if check_cancelled(task_id, client): return
     
     all_research = "\n\n---\n\n".join(research_results)
     
@@ -457,6 +466,7 @@ Now parse the request:"""
 
         parsed = llm_call(parse_prompt)
         log(f"Parsed: {parsed}", "agent")
+        if check_cancelled(task_id, client): return
 
         event_name    = extract_field(parsed, "EVENT_NAME")
         date_time_text = extract_field(parsed, "DATE_TIME")
@@ -497,6 +507,7 @@ Now parse the request:"""
             continue
 
         log(f"Resolved: {dt.strftime('%A %d %B %Y at %H:%M')}", "info")
+        if check_cancelled(task_id, client): return
 
         # =====================================================================
         # STEP 3: Confirm with user
