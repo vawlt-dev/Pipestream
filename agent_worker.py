@@ -17,7 +17,7 @@ import os
 import time
 import requests
 from datetime import datetime
-from workflows import business_intro_workflow
+from router import route_workflow
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -149,8 +149,8 @@ def run_worker():
                 client.log(task_id, "Agent picked up task", "info")
                 
                 try:
-                    # Run the workflow
-                    business_intro_workflow(task_id, input_text, client)
+                    # Classify intent and run the appropriate workflow
+                    route_workflow(task_id, input_text, client)
                     
                 except Exception as e:
                     error_msg = str(e)
