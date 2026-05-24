@@ -9,7 +9,6 @@ import os
 import base64
 import pickle
 from email.mime.text import MIMEText
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -98,10 +97,10 @@ def get_emails(max_results: int = 500) -> list[dict]:
         snippet, is_starred, is_important, is_unread, is_automated,
         internal_date (ms unix timestamp, use for sorting)
     """
-    creds = get_google_credentials()
+    creds   = get_google_credentials()
+    service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
 
-    # Use a single service to list message IDs (just one call)
-    service  = build('gmail', 'v1', credentials=creds)
+    # Step 1: get message ID stubs (single API call)
     response = service.users().messages().list(
         userId='me',
         maxResults=max_results,
@@ -112,41 +111,41 @@ def get_emails(max_results: int = 500) -> list[dict]:
     if not stubs:
         return []
 
-    # Each thread builds its own service — cache_discovery=False avoids
-    # filesystem race conditions when multiple threads call build() simultaneously
-    def fetch_meta(stub):
-        svc    = build('gmail', 'v1', credentials=creds, cache_discovery=False)
-        detail = svc.users().messages().get(
-            userId='me',
-            id=stub['id'],
-            format='metadata',
-            metadataHeaders=['From', 'Subject', 'Date', 'List-Unsubscribe', 'Message-ID'],
-        ).execute()
-        headers   = {h['name']: h['value'] for h in detail.get('payload', {}).get('headers', [])}
-        label_ids = detail.get('labelIds', [])
-        return {
-            'id':                stub['id'],
-            'thread_id':         detail['threadId'],
+    # Step 2: batch-fetch metadata — up to 100 requests per HTTP call.
+    # This avoids threading entirely (httplib2 is not thread-safe).
+    results: list[dict] = []
+
+    def _on_meta(request_id, response, exception):
+        if exception or not response:
+            return
+        headers   = {h['name']: h['value'] for h in response.get('payload', {}).get('headers', [])}
+        label_ids = response.get('labelIds', [])
+        results.append({
+            'id':                response['id'],
+            'thread_id':         response['threadId'],
             'subject':           headers.get('Subject', '(no subject)'),
             'sender':            headers.get('From', ''),
             'date':              headers.get('Date', ''),
             'message_id_header': headers.get('Message-ID', ''),
-            'snippet':           detail.get('snippet', ''),
+            'snippet':           response.get('snippet', ''),
             'is_starred':        'STARRED'   in label_ids,
             'is_important':      'IMPORTANT' in label_ids,
             'is_unread':         'UNREAD'    in label_ids,
             'is_automated':      'List-Unsubscribe' in headers,
-            'internal_date':     int(detail.get('internalDate', 0)),
-        }
+            'internal_date':     int(response.get('internalDate', 0)),
+        })
 
-    results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(fetch_meta, s) for s in stubs]
-        for future in as_completed(futures, timeout=120):
-            try:
-                results.append(future.result())
-            except Exception:
-                pass
+    BATCH_SIZE = 100  # Gmail API hard limit per batch request
+    for i in range(0, len(stubs), BATCH_SIZE):
+        batch = service.new_batch_http_request(callback=_on_meta)
+        for stub in stubs[i:i + BATCH_SIZE]:
+            batch.add(service.users().messages().get(
+                userId='me',
+                id=stub['id'],
+                format='metadata',
+                metadataHeaders=['From', 'Subject', 'Date', 'List-Unsubscribe', 'Message-ID'],
+            ))
+        batch.execute()
 
     results.sort(key=lambda x: x['internal_date'], reverse=True)
     return results
