@@ -284,9 +284,27 @@ def gather_info(topic: str, topic_level: str, task_id: str, client, log, context
 # X" instructions aren't reliable with this model, so don't rely on the
 # prompt alone to prevent this.
 
-_SUBJECT_PREFIX_RE = re.compile(r'^subject\s*:\s*', re.IGNORECASE)
-_GREETING_LINE_RE  = re.compile(r'^(hi|hello|dear|greetings|hey)\b.*,?\s*$', re.IGNORECASE)
-_SIGNOFF_RE        = re.compile(
+# Used by clean_email_draft() — strips the WHOLE leaked subject line (label
+# + text), since the line itself is entirely unwanted there.
+_SUBJECT_LINE_RE    = re.compile(r'^\s*subject\s*:\s*[^\n]{0,100}\n*', re.IGNORECASE)
+# Used by clean_subject_line() — strips only the "Subject:" label, since the
+# text after it there IS the wanted subject.
+_SUBJECT_LABEL_RE   = re.compile(r'^\s*subject\s*:\s*', re.IGNORECASE)
+# Two greeting patterns, tried in order:
+#   1. _GREETING_BLOCK_RE — a greeting followed by a real paragraph break
+#      (blank line). Doesn't care about commas inside the clause at all, so
+#      multi-recipient salutations ("Hi Josh, Joren, and Carla,") are handled
+#      correctly regardless of how many internal commas they contain.
+#   2. _GREETING_PREFIX_RE — fallback for single-blob output with no paragraph
+#      break to anchor on (schema-enforced bodies often have zero embedded
+#      newlines at all). Stops at the first comma, since without a paragraph
+#      break there's no reliable signal for "where the greeting ends" beyond
+#      that — this won't correctly handle a multi-recipient greeting in a
+#      no-newline body, but failing to fully strip a greeting is a far safer
+#      failure mode than deleting the entire body.
+_GREETING_BLOCK_RE   = re.compile(r'^\s*(hi|hello|dear|greetings|hey)\b[^\n]{0,80}\n\s*\n+', re.IGNORECASE)
+_GREETING_PREFIX_RE  = re.compile(r'^\s*(hi|hello|dear|greetings|hey)\b[^,\n]{0,60},\s*', re.IGNORECASE)
+_SIGNOFF_RE          = re.compile(
     r'\n\s*(best regards|best wishes|best,|kind regards|regards,|sincerely|'
     r'warm regards|warmly|cheers,|thanks,|thank you,)\b',
     re.IGNORECASE,
@@ -295,25 +313,32 @@ _SIGNOFF_RE        = re.compile(
 
 def clean_email_draft(body: str) -> str:
     """
-    Strip a leaked 'Subject:' line, a leaked greeting line, and a leaked
+    Strip a leaked 'Subject:' prefix, a leaked greeting clause, and a leaked
     sign-off block from a model-generated email body before concatenating it
     with the workflow's own greeting + signature.
+
+    Matches are bounded PREFIXES (via re.sub with a capped repetition count),
+    not whole "lines" via splitlines() — schema-enforced structured output
+    often returns the body as one continuous string with zero embedded
+    newlines (the model doesn't paragraph-break inside a JSON string field
+    the way it does in free text). An earlier version matched whole lines
+    with an unbounded greedy `.*` in the greeting pattern; with only one
+    "line" to match against (no \n to stop splitlines() from treating the
+    entire body as one line), that swallowed the ENTIRE body as "the
+    greeting" and silently deleted it. Bounding both patterns by character
+    count fixes that while still catching the original multi-line
+    "Hi Team,\n\n" case — see _GREETING_BLOCK_RE / _GREETING_PREFIX_RE above
+    for why there are two patterns, tried in order.
     """
-    lines = body.strip().splitlines()
+    text = body.strip()
+    text = _SUBJECT_LINE_RE.sub('', text, count=1).strip()
 
-    def _drop_leading_blank():
-        while lines and not lines[0].strip():
-            lines.pop(0)
+    new_text = _GREETING_BLOCK_RE.sub('', text, count=1)
+    if new_text != text:
+        text = new_text.strip()
+    else:
+        text = _GREETING_PREFIX_RE.sub('', text, count=1).strip()
 
-    _drop_leading_blank()
-    if lines and _SUBJECT_PREFIX_RE.match(lines[0].strip()):
-        lines.pop(0)
-        _drop_leading_blank()
-    if lines and _GREETING_LINE_RE.match(lines[0].strip()):
-        lines.pop(0)
-        _drop_leading_blank()
-
-    text = '\n'.join(lines)
     signoff_match = _SIGNOFF_RE.search(text)
     if signoff_match:
         text = text[:signoff_match.start()]
@@ -328,7 +353,7 @@ def clean_subject_line(subject: str) -> str:
     multi-line subject crashes MIME header encoding outright — take only the
     first real candidate.
     """
-    subject = _SUBJECT_PREFIX_RE.sub('', subject.strip())
+    subject = _SUBJECT_LABEL_RE.sub('', subject.strip())
     first_line = next((l.strip() for l in subject.splitlines() if l.strip()), subject)
     first_line = re.sub(r'^or\s+', '', first_line, flags=re.IGNORECASE)
     return first_line.strip().strip('"').strip("'")
