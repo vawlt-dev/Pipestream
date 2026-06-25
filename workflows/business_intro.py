@@ -8,15 +8,20 @@
 #   drafts it, gets user approval, then sends via Gmail.
 # =============================================================================
 
-import re
 from core import (
-    llm_call, gather_info, format_answers_as_context,
+    llm_structured, gather_info, format_answers_as_context,
     clean_email_draft, clean_subject_line, extract_greeting_name,
-    wait_for_input, check_cancelled, extract_field,
+    wait_for_input, check_cancelled,
     SENDER_NAME, SENDER_TITLE, SENDER_WEBSITE, SENDER_BIO,
 )
+from schemas import s_object, s_string
 from research import find_contact_email
 from tools_google import send_email
+
+_PARSED_REQUEST_SCHEMA = s_object({"company": s_string(), "email": s_string()})
+_ANGLE_SCHEMA          = s_object({"angle": s_string()})
+_DRAFT_BODY_SCHEMA     = s_object({"body": s_string()})
+_SUBJECT_LINE_SCHEMA   = s_object({"subject": s_string()})
 
 WORKFLOW_META = {
     "name": "business_intro",
@@ -45,29 +50,14 @@ def run(task_id: str, input_text: str, client) -> None:
 
 Request: "{input_text}"
 
-Respond in this exact format:
-COMPANY: <company name>
-EMAIL: <email address or "not provided">
+company: the company name to research
+email: the email address to send to, or "not provided" if none is given"""
 
-Examples:
-Request: "Research Acme Corp and send intro to bob@acme.com"
-COMPANY: Acme Corp
-EMAIL: bob@acme.com
-
-Request: "Look up TechStartup Wellington"
-COMPANY: TechStartup Wellington
-EMAIL: not provided
-
-Now parse the request:"""
-
-    parsed = llm_call(parse_prompt)
+    parsed = llm_structured(parse_prompt, _PARSED_REQUEST_SCHEMA, schema_name="parsed_request")
     log(f"Parsed: {parsed}", "agent")
 
-    company_match = re.search(r"COMPANY:\s*(.+)", parsed, re.IGNORECASE)
-    email_match   = re.search(r"EMAIL:\s*(.+)", parsed, re.IGNORECASE)
-
-    company_name = company_match.group(1).strip() if company_match else None
-    target_email = email_match.group(1).strip() if email_match else None
+    company_name = str(parsed.get("company") or "").strip() or None
+    target_email = str(parsed.get("email") or "").strip() or None
 
     if target_email and target_email.lower() == "not provided":
         target_email = None
@@ -130,9 +120,10 @@ The angle should be rooted in something concrete from the research — a recent 
 Research:
 {research_context}
 
-Reply with ONLY a short phrase describing the angle (e.g. "their recent expansion into healthcare", "the supply chain problem they're solving for NZ manufacturers"). No quotes, no explanation:"""
+angle: a short phrase describing the angle (e.g. "their recent expansion into healthcare", "the supply chain problem they're solving for NZ manufacturers"), no quotes"""
 
-    angle = llm_call(angle_prompt).strip().strip('"').strip("'")
+    angle_result = llm_structured(angle_prompt, _ANGLE_SCHEMA, schema_name="email_angle")
+    angle = str(angle_result.get("angle") or "").strip().strip('"').strip("'")
     log(f"Email angle: {angle}", "agent")
     if check_cancelled(task_id, client):
         return
@@ -174,9 +165,10 @@ Guidelines:
 - Do NOT invent or guess at names, emails, phone numbers, or other contact
   details that aren't given to you above — omit them rather than making them up
 
-Write ONLY the email body:"""
+body: the email body only"""
 
-    draft_body = clean_email_draft(llm_call(draft_prompt))
+    draft_result = llm_structured(draft_prompt, _DRAFT_BODY_SCHEMA, schema_name="email_draft_body")
+    draft_body = clean_email_draft(str(draft_result.get("body") or ""))
     log(f"Draft:\n{draft_body}", "agent")
 
     subject_prompt = f"""Write a short email subject line for an introduction to {company_name}.
@@ -184,9 +176,11 @@ Write ONLY the email body:"""
 The email is about: {angle}
 
 Under 50 characters. Be specific to this company, not generic. No emojis.
-Write ONLY the subject line:"""
 
-    subject_line = clean_subject_line(llm_call(subject_prompt))
+subject: the subject line only"""
+
+    subject_result = llm_structured(subject_prompt, _SUBJECT_LINE_SCHEMA, schema_name="subject_line")
+    subject_line = clean_subject_line(str(subject_result.get("subject") or ""))
     log(f"Subject: {subject_line}", "agent")
 
     full_email = f"""{greeting},

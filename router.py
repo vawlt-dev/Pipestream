@@ -15,7 +15,8 @@ import os
 import sys
 import importlib.util
 
-from core import llm_call, wait_for_input
+from core import llm_structured, wait_for_input
+from schemas import s_object, s_enum
 
 WORKFLOWS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflows")
 
@@ -74,13 +75,18 @@ def load_workflows() -> dict:
 
 def classify_intent(input_text: str, registry: dict) -> str:
     """
-    Show the LLM the full description of every available workflow and ask it to pick one.
-    Returns the workflow name, or "unknown" if none fit.
+    Show the LLM the full description of every available workflow and ask it
+    to pick one. The "workflow" field is enum-constrained to the literal
+    discovered workflow names plus "unknown" — the model cannot return a
+    garbled or markdown-escaped name (e.g. "lead\\_gen\\_outreach"), since
+    that string isn't a member of the enum and grammar-constrained decoding
+    can't produce it in the first place.
     """
     workflow_list = "\n".join(
         f'- "{name}": {info["meta"]["description"]}'
         for name, info in registry.items()
     )
+    valid_names = list(registry.keys()) + ["unknown"]
 
     prompt = f"""Choose the best workflow to handle this request.
 
@@ -90,15 +96,12 @@ Available workflows:
 
 Request: "{input_text}"
 
-Reply with ONLY the workflow name (e.g. business_intro) or "unknown":"""
+Choose the workflow name."""
 
-    result = llm_call(prompt).strip().lower().strip('"').strip("'")
-    result = result.replace('\\', '')  # Mistral sometimes markdown-escapes underscores as \_
-
-    for name in registry:
-        if name in result:
-            return name
-    return "unknown"
+    schema = s_object({"workflow": s_enum(valid_names)})
+    result = llm_structured(prompt, schema, schema_name="intent_classification")
+    workflow_name = result.get("workflow")
+    return workflow_name if workflow_name in valid_names else "unknown"
 
 
 def route_workflow(task_id: str, input_text: str, client, _depth: int = 0) -> None:

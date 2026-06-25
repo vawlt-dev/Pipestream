@@ -13,10 +13,11 @@
 import re
 
 from core import (
-    llm_call, llm_structured, gather_info, format_answers_as_context,
+    llm_structured, gather_info, format_answers_as_context,
     clean_email_draft, clean_subject_line, extract_greeting_name,
     check_cancelled,
 )
+from schemas import s_object, s_string, s_int, s_array
 from research import find_contact_email
 from tools_web import web_search
 from tools_google import create_email_draft
@@ -35,12 +36,31 @@ WORKFLOW_META = {
     ),
 }
 
-_COMPANY_LIST_SCHEMA = {
-    "type": "object",
-    "properties": {"companies": {"type": "array", "items": {"type": "string"}}},
-    "required": ["companies"],
-    "additionalProperties": False,
-}
+_COMPANY_LIST_SCHEMA = s_object({"companies": s_array(s_string())})
+
+# Extraction forces a `reason` per candidate — the actual value isn't JSON
+# parsing reliability (already solved), it's that requiring a justification
+# catches semantically wrong inclusions (e.g. a competitor or an unrelated
+# entity that just showed up prominently in the search results).
+_CANDIDATE_SCHEMA = s_object({
+    "companies": s_array(s_object({
+        "name":   s_string(),
+        "reason": s_string(),
+    })),
+})
+
+_PARSED_REQUEST_SCHEMA = s_object({
+    "sender_name":    s_string(),
+    "sender_title":   s_string(),
+    "sender_company": s_string(),
+    "goal":           s_string(),
+    "count":          s_int(),
+})
+
+_SEARCH_QUERIES_SCHEMA = s_object({"queries": s_array(s_string())})
+_ANGLE_SCHEMA          = s_object({"angle": s_string()})
+_DRAFT_BODY_SCHEMA     = s_object({"body": s_string()})
+_SUBJECT_LINE_SCHEMA   = s_object({"subject": s_string()})
 
 
 # =============================================================================
@@ -66,18 +86,7 @@ def run(task_id: str, input_text: str, client) -> None:
         f'sender_company: their company name\n'
         f'goal: what they want to achieve / who they want to reach, in one line\n'
         f'count: number of companies to find — just the number, default 10 if not specified',
-        {
-            "type": "object",
-            "properties": {
-                "sender_name":    {"type": "string"},
-                "sender_title":   {"type": "string"},
-                "sender_company": {"type": "string"},
-                "goal":           {"type": "string"},
-                "count":          {"type": "integer"},
-            },
-            "required": ["sender_name", "sender_title", "sender_company", "goal", "count"],
-            "additionalProperties": False,
-        },
+        _PARSED_REQUEST_SCHEMA,
         schema_name="parsed_request",
     )
     log(f'Parsed: {parsed}', 'agent')
@@ -134,7 +143,7 @@ def run(task_id: str, input_text: str, client) -> None:
     # =========================================================================
     log('🔍 Generating prospect search queries...', 'info')
 
-    queries_raw = llm_call(
+    queries_result = llm_structured(
         f'A company needs to find prospective CLIENTS — companies that NEED this kind '
         f'of help, not companies that PROVIDE similar or competing services.\n\n'
         f'Their company: {sender_company}\n'
@@ -145,12 +154,13 @@ def run(task_id: str, input_text: str, client) -> None:
         f'experiencing the problem or need described in the goal — NOT around '
         f'companies that already offer that same service (those are competitors, '
         f'not prospects). Each query should be aimed at surfacing actual company '
-        f'names and websites, not generic articles.\n\n'
-        f'Reply with one query per line, no numbering, no extra text.'
+        f'names and websites, not generic articles.',
+        _SEARCH_QUERIES_SCHEMA,
+        schema_name="search_queries",
     )
-    log(f'Search queries:\n{queries_raw}', 'agent')
+    log(f'Search queries: {queries_result}', 'agent')
 
-    queries = [q.strip().strip('-').strip() for q in queries_raw.splitlines() if q.strip()][:4]
+    queries = [str(q).strip() for q in (queries_result.get('queries') or []) if str(q).strip()][:4]
 
     all_results = []
     for q in queries:
@@ -174,21 +184,26 @@ def run(task_id: str, input_text: str, client) -> None:
         f'generic terms, AND any company that appears to PROVIDE the same or a '
         f'competing service to {sender_company} rather than NEEDING it — those are '
         f'competitors, not prospects, even if they show up prominently in the results.\n\n'
+        f'For each company, give its name and a one-line reason it fits as a prospect '
+        f'(not a competitor).\n\n'
         f'Search results:\n{combined_results[:10000]}',
-        _COMPANY_LIST_SCHEMA,
+        _CANDIDATE_SCHEMA,
         schema_name="candidate_companies",
     )
     log(f'Candidates: {extracted}', 'agent')
-    candidate_names = extracted.get('companies') or []
+    candidates = extracted.get('companies') or []
 
     seen = set()
     unique_candidates = []
-    for name in candidate_names:
-        name = str(name).strip()
-        key  = name.lower()
+    for c in candidates:
+        name   = str(c.get('name') or '').strip()
+        reason = str(c.get('reason') or '').strip()
+        key    = name.lower()
         if key and key not in seen and key != sender_company.strip().lower():
             seen.add(key)
             unique_candidates.append(name)
+            if reason:
+                log(f'  {name}: {reason}', 'info')
 
     if not unique_candidates:
         log('No candidate companies found', 'error')
@@ -251,7 +266,7 @@ def run(task_id: str, input_text: str, client) -> None:
         research_context = format_answers_as_context(info)
 
         # --- Angle ---
-        angle = llm_call(
+        angle_result = llm_structured(
             f'Based on this research about {company_name}, identify the single most '
             f'compelling, specific angle for a cold outreach email from {sender_name} '
             f'({sender_title} at {sender_company}).\n\n'
@@ -260,8 +275,11 @@ def run(task_id: str, input_text: str, client) -> None:
             f'what makes this company distinctive, a challenge {sender_company} could '
             f'help with. Not generic flattery.\n\n'
             f'Research:\n{research_context}\n\n'
-            f'Reply with ONLY a short phrase describing the angle. No quotes, no explanation:'
-        ).strip().strip('"').strip("'")
+            f'angle: a short phrase describing the angle, no quotes',
+            _ANGLE_SCHEMA,
+            schema_name="outreach_angle",
+        )
+        angle = str(angle_result.get('angle') or '').strip().strip('"').strip("'")
         log(f'Angle for {company_name}: {angle}', 'agent')
 
         # Best-effort — only available if Q3 (stakeholders) was one of the 3
@@ -276,7 +294,7 @@ def run(task_id: str, input_text: str, client) -> None:
         greeting = f'Hi {greeting_name}' if greeting_name else 'Hi'
 
         # --- Draft body ---
-        draft_body = clean_email_draft(llm_call(
+        draft_result = llm_structured(
             f'Write a short, professional cold outreach email to {company_name}.\n\n'
             f'The email should be anchored around this angle: {angle}\n\n'
             f'Context:\n'
@@ -295,19 +313,17 @@ def run(task_id: str, input_text: str, client) -> None:
             f'- Do NOT invent or guess at names, emails, phone numbers, or other '
             f'contact details that aren\'t given to you above — omit them rather '
             f'than making them up\n\n'
-            f'Write ONLY the email body:'
-        ))
+            f'body: the email body only',
+            _DRAFT_BODY_SCHEMA,
+            schema_name="email_draft_body",
+        )
+        draft_body = clean_email_draft(str(draft_result.get('body') or ''))
 
         subject_result = llm_structured(
             f'Write a short email subject line (under 50 characters) for outreach to '
             f'{company_name} about: {angle}\n'
             f'No emojis, no quotes.',
-            {
-                "type": "object",
-                "properties": {"subject": {"type": "string"}},
-                "required": ["subject"],
-                "additionalProperties": False,
-            },
+            _SUBJECT_LINE_SCHEMA,
             schema_name="subject_line",
         )
         subject_line = clean_subject_line(str(subject_result.get('subject') or ''))

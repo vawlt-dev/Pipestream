@@ -77,51 +77,97 @@ encourages it to fire more often without a real reason — if it starts firing
 frequently, that's a signal to build the deferred/async version, not to relax
 the gate prompt.
 
-## LLM Function Selection
+## LLM Calls: every call is schema-first
 
-The two LLM functions have different purposes — use the right one for the job.
+There is one LLM-calling primitive for every call site, including free-form
+writing: `llm_structured(prompt, schema, schema_name)` from `core.py`. The
+old `llm_call` / `llm_classify` / `llm_classify_prefill` / `extract_field`
+functions are gone — don't reintroduce regex/labeled-field parsing of raw
+LLM text output. Build the schema first, then write the prompt around it,
+then call the LLM, then read the parsed dict:
 
-### `llm_call(prompt)` — for writing
-Use when Mistral should produce free-form text intended for a human to read.
-- Drafting emails
-- Writing reply bodies
-- Summarising research
-- Any creative or conversational output
+```python
+from core import llm_structured
+from schemas import s_object, s_string, s_enum, s_array, s_bool, s_int
 
-### `llm_classify_prefill(prompt)` — for structured output
-Use when Mistral needs to return a constrained, machine-readable response.
-- Classifying emails (reply_needed / fyi / etc.)
-- KEEP / REMOVE decisions
-- YES / SKIP / EDIT decisions
-- Any numbered list output
+_DRAFT_SCHEMA = s_object({"body": s_string()})
 
-A system message forces "classifier mode" — no explanations, no reasoning, just
-the format. The prefill forces output to start with `1:` so the model can't open
-with prose. This saves significant tokens on every classification call.
+result = llm_structured(
+    f"Draft a reply to this thread...\n\nbody: the reply body only",
+    _DRAFT_SCHEMA,
+    schema_name="reply_draft",
+)
+draft_body = str(result.get("body") or "")
+```
 
-### `llm_classify(prompt)` — structured output without a numbered list
-Same constraint preamble as `llm_classify_prefill` but without the `1:`
-prefill. Use for single-value classification (e.g. one label, one word).
+This applies to free-form prose too (email bodies, drafted replies) — wrap it
+in a single `{"body": ...}` field rather than reaching for unstructured text.
+The backend hard-constrains generation token-by-token to the schema, which is
+why this fixes an entire class of bugs that prompt instructions alone never
+reliably did (a "single subject line" request coming back as five
+newline-joined alternatives, a workflow name coming back markdown-escaped).
+
+### `schemas.py` — composable schema builders
+Use these instead of hand-writing raw schema dicts at call sites:
+- `s_string()`, `s_int()`, `s_bool()` — primitive fields
+- `s_enum(["a", "b"])` — a string constrained to a fixed, known set of
+  values. **Always prefer this over a free-form string** wherever the valid
+  values are known ahead of time (classifications, YES/SKIP/EDIT decisions,
+  workflow names) — it makes invalid output structurally impossible rather
+  than something you clean up after the fact
+- `s_array(item_schema)` — a list of some other schema (string, enum, or
+  nested object)
+- `s_object(properties, required=None)` — top-level or nested object;
+  defaults to requiring every declared property and `additionalProperties:
+  false`, matching what `llm_structured()`'s `strict` mode needs
+
+Declare one module-level `_THING_SCHEMA = s_object({...})` per distinct shape
+near the top of the workflow file, and reuse it across call sites that share
+a shape (e.g. one booking-extraction schema reused by both the first-pass
+extraction and a clarification re-extraction).
+
+When you need an array of objects rather than an array of bare strings — e.g.
+extracting candidate companies — prefer `s_array(s_object({"name": ...,
+"reason": ...}))` over a flat list of names. Forcing a `reason`/justification
+field per item is what catches a model including something that doesn't
+actually belong (a competitor, an unrelated entity) — the value isn't JSON
+parsing reliability (schema-constrained output already guarantees that), it's
+that requiring a justification surfaces semantically wrong inclusions that a
+flat string list would hide.
+
+### `llm_generate_schema(description)` — escape hatch, not a default
+For the rare call whose output shape genuinely isn't knowable ahead of time,
+`schemas.py` exposes `llm_generate_schema()` — it asks the LLM to design its
+own schema for another LLM call, validates the result against the real JSON
+Schema meta-schema, and falls back to a fully permissive `{"type": "object"}`
+on any failure (bad JSON, invalid schema) rather than crashing. Prefer a
+hand-built schema from the builders above wherever the shape is knowable —
+this exists for genuinely dynamic/one-off shapes, not as a shortcut to avoid
+designing a schema.
 
 > **Note:** Mistral 7B in LM Studio only supports `user` and `assistant` roles.
-> Never use `SystemMessage` — it will crash with a 400 error. Constraints must
-> be prepended to the user message instead.
+> Never use `SystemMessage` — it will crash with a 400 error. Any constraint
+> must be expressed in the prompt text itself; `llm_structured()`'s
+> `response_format` schema is what actually enforces shape, not a system
+> message.
 
 ---
 
 ## Prompt Design Rules
 
-**Structured output prompts** — keep them minimal:
-- List the input as `N. sender | subject` — no snippets, no extra fields
-- One-line format instruction at the end: `Reply with one line per email in the format   N: action`
-- Do NOT put example output lines at the bottom — the model treats them as
-  its own output and continues in the wrong style
-- Do NOT ask for reasoning or explanations — that's wasted tokens
-
-**Text generation prompts** — be explicit about what NOT to include:
-- "Do NOT include a greeting or sign-off"
-- "Write ONLY the reply body"
-- Explicitly state tone/length expectations
+Since the schema enforces shape, prompts only need to describe content:
+- List each field as a short label, e.g. `event_name: what is being booked,
+  or "not found"` — don't restate JSON syntax, the schema already is the
+  format instruction
+- Do NOT ask for reasoning or explanations on fields that don't need one —
+  that's wasted tokens
+- Be explicit about content constraints text generation still needs:
+  "Do NOT include a greeting or sign-off", explicit tone/length expectations
+- For an array field meant to align 1:1 with a numbered input list (e.g. one
+  classification per email), say so explicitly ("in the same order") and pad
+  defensively on the read side — `result.get("things") or []` then
+  `list(... ) + [default] * shortfall` — rather than assuming the model
+  returns exactly the expected length
 
 ---
 

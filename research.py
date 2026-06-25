@@ -25,9 +25,10 @@
 
 import re
 
-from core import llm_call, llm_classify_prefill, extract_field, check_cancelled
+from core import llm_structured, check_cancelled
+from schemas import s_object, s_string, s_bool, s_enum, s_array
 from tools_web import web_search
-from memory import memory_get_question, memory_set_question
+from memory import memory_get_question, memory_set_question, VOLATILITY_DAYS
 
 # =============================================================================
 # THE 15 SEED QUESTIONS
@@ -112,11 +113,16 @@ def _build_query(topic: str, topic_level: str, question_id: str) -> str:
 # QUESTION SELECTION
 # =============================================================================
 
+_QUESTION_SELECTION_SCHEMA = s_object({
+    "selected": s_array(s_enum(list(SEED_QUESTIONS.keys()))),
+})
+
+
 def select_seed_questions(topic: str, topic_level: str, context: str = "") -> list[str]:
     """
     Ask the LLM to pick the 3 most relevant of the 15 seed questions for this
-    topic and task context. One LLM call. Regex-parsed, not JSON — consistent
-    with the rest of the codebase's structured-output convention.
+    topic and task context. enum-constrained to the 15 known Q-ids, so the
+    model can't return a malformed or invented question ID.
     """
     question_list = "\n".join(
         f"{qid}: {text.replace('{X}', topic)}" for qid, text in SEED_QUESTIONS.items()
@@ -134,12 +140,10 @@ Task context: {context or "none"}
 Questions available:
 {question_list}
 
-Pick the 3 most useful questions for this context. Reply with ONLY:
-SELECTED: Q#, Q#, Q#"""
+Pick the 3 most useful questions for this context."""
 
-    result = llm_call(prompt)
-    selected_raw = extract_field(result, "SELECTED")
-    ids = re.findall(r'Q\d+', selected_raw)
+    result = llm_structured(prompt, _QUESTION_SELECTION_SCHEMA, schema_name="seed_question_selection")
+    ids = result.get("selected") or []
 
     seen: list[str] = []
     for qid in ids:
@@ -147,7 +151,7 @@ SELECTED: Q#, Q#, Q#"""
             seen.append(qid)
 
     if not seen:
-        seen = ["Q1", "Q5", "Q14"]  # sane fallback if parsing fails entirely
+        seen = ["Q1", "Q5", "Q14"]  # sane fallback if the model returns an empty selection
 
     return seen[:3]
 
@@ -155,6 +159,13 @@ SELECTED: Q#, Q#, Q#"""
 # =============================================================================
 # EXTRACTION
 # =============================================================================
+
+_ANSWER_SCHEMA = s_object({
+    "answer":     s_string(),
+    "confidence": s_enum(["high", "medium", "low"]),
+    "volatility": s_enum(list(VOLATILITY_DAYS.keys())),
+})
+
 
 def _extract_answer(topic: str, topic_level: str, question_text: str, corpus: str, context: str) -> dict:
     """One LLM call: answer + confidence + volatility classification, in one shot."""
@@ -176,16 +187,15 @@ Question: {question_text}
 Research:
 {corpus[:8000]}
 
-Respond in this exact format:
-ANSWER: <1-2 sentences, or "not found" if the research doesn't address it>
-CONFIDENCE: <high/medium/low>
-VOLATILITY: <one of VOLATILE, FAST, NORMAL, SLOW, GLACIAL — how fast THIS SPECIFIC answer would go stale. Judge the actual content, not the question category: "they just rebranded last week" is VOLATILE even for a usually-stable question.>"""
+answer: 1-2 sentences, or "not found" if the research doesn't address it
+confidence: high, medium, or low
+volatility: how fast THIS SPECIFIC answer would go stale. Judge the actual content, not the question category — "they just rebranded last week" is VOLATILE even for a usually-stable question."""
 
-    result = llm_call(prompt)
+    result = llm_structured(prompt, _ANSWER_SCHEMA, schema_name="seed_question_answer")
     return {
-        "answer":     extract_field(result, "ANSWER"),
-        "confidence": extract_field(result, "CONFIDENCE").lower(),
-        "volatility": extract_field(result, "VOLATILITY").upper(),
+        "answer":     result.get("answer") or "not found",
+        "confidence": (result.get("confidence") or "medium").lower(),
+        "volatility": (result.get("volatility") or "NORMAL").upper(),
     }
 
 
@@ -249,6 +259,10 @@ def answer_question(
 # BOUNDED BRANCHING DEEP DIVE
 # =============================================================================
 
+_FOLLOWUPS_SCHEMA = s_object({"followups": s_array(s_string())})
+_RELEVANCE_SCHEMA = s_object({"relevant": s_bool()})
+
+
 def generate_followups(topic: str, parent_question_text: str, answer_text: str, context: str) -> list[str]:
     """Up to 4 follow-up questions generated from one answered question."""
     prompt = f"""Based on this question and answer about "{topic}", generate up to 4 specific follow-up questions that would deepen understanding for this goal: {context or "general research"}
@@ -256,14 +270,11 @@ def generate_followups(topic: str, parent_question_text: str, answer_text: str, 
 Question: {parent_question_text}
 Answer: {answer_text}
 
-Reply with one follow-up question per line, no numbering, no extra text. If none are useful, reply "NONE"."""
+Return an empty list if none are useful."""
 
-    result = llm_call(prompt)
-    if result.strip().upper().startswith("NONE"):
-        return []
-
-    lines = [l.strip().lstrip('-').strip() for l in result.splitlines() if l.strip()]
-    return lines[:4]
+    result = llm_structured(prompt, _FOLLOWUPS_SCHEMA, schema_name="followups")
+    followups = result.get("followups") or []
+    return [f.strip() for f in followups if f.strip()][:4]
 
 
 def check_relevance(followup_question: str, seed_question_text: str, context: str) -> bool:
@@ -277,11 +288,10 @@ def check_relevance(followup_question: str, seed_question_text: str, context: st
         f'Original research goal: {seed_question_text}\n'
         f'Task context: {context or "none"}\n\n'
         f'Candidate follow-up question: "{followup_question}"\n\n'
-        f'Does answering this follow-up question help achieve the original research goal? '
-        f'Reply with one line in the format   1: YES   or   1: NO'
+        f'Does answering this follow-up question help achieve the original research goal?'
     )
-    result = llm_classify_prefill(prompt)
-    return bool(re.search(r'1[.:]\s*YES', result, re.IGNORECASE))
+    result = llm_structured(prompt, _RELEVANCE_SCHEMA, schema_name="relevance_check")
+    return bool(result.get("relevant"))
 
 
 def branch_research(
@@ -333,6 +343,9 @@ def branch_research(
     return all_rows
 
 
+_DEEP_DIVE_SCHEMA = s_object({"decision": s_bool(), "justification": s_string()})
+
+
 def should_deep_dive(topic: str, context: str, task_id: str, client, log) -> tuple[bool, str]:
     """
     The synchronous escape-hatch gate. Narrow, explicit prompt — not a vague
@@ -349,14 +362,11 @@ def should_deep_dive(topic: str, context: str, task_id: str, client, log) -> tup
         f'specific task, enough to justify several minutes of additional research time '
         f'before continuing?\n\n'
         f'Task context: {context or "none"}\n\n'
-        f'Reply in this exact format:\n'
-        f'DECISION: YES or NO\n'
-        f'JUSTIFICATION: <one line>'
+        f'Give a one-line justification either way.'
     )
-    result = llm_call(prompt)
-    decision       = extract_field(result, "DECISION").strip().upper()
-    justification  = extract_field(result, "JUSTIFICATION")
-    fires = decision.startswith("YES")
+    result = llm_structured(prompt, _DEEP_DIVE_SCHEMA, schema_name="deep_dive_decision")
+    fires = bool(result.get("decision"))
+    justification = result.get("justification") or ""
 
     log(
         f"{'🌳 Deep dive triggered' if fires else 'Deep dive declined'}: {justification}",
@@ -373,6 +383,9 @@ def should_deep_dive(topic: str, context: str, task_id: str, client, log) -> tup
 # in as a 16th question. Prospect-only — doesn't make sense for a persona/role
 # topic.
 
+_CONTACT_EMAIL_SCHEMA = s_object({"email": s_string()})
+
+
 def find_contact_email(topic: str, task_id: str, client, log) -> str | None:
     log(f"🔍 {topic} contact email", "tool_call")
     result_text = web_search(f"{topic} contact email", max_results=5)
@@ -382,10 +395,13 @@ def find_contact_email(topic: str, task_id: str, client, log) -> str | None:
     if match:
         return match.group()
 
-    extracted = llm_call(
+    result = llm_structured(
         f'Find a contact email address for "{topic}" in this text, if present.\n\n'
         f'{result_text[:4000]}\n\n'
-        f'Reply with ONLY the email address, or "none found":'
-    ).strip()
+        f'Return an empty string for "email" if none is present in the text.',
+        _CONTACT_EMAIL_SCHEMA,
+        schema_name="contact_email",
+    )
+    extracted = (result.get("email") or "").strip()
     match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', extracted)
     return match.group() if match else None
