@@ -7,6 +7,7 @@
 
 import os
 import re
+import json
 import time
 from datetime import datetime
 
@@ -57,6 +58,10 @@ _llm = ChatOpenAI(**_BASE_KWARGS, temperature=0.7)
 # Classification LLM — low temperature, hard token cap so it can't ramble
 _llm_classify = ChatOpenAI(**_BASE_KWARGS, temperature=0.1, max_tokens=512)
 
+# Structured-output LLM — low temperature, used only with a JSON Schema
+# response_format (see llm_structured below)
+_llm_structured = ChatOpenAI(**_BASE_KWARGS, temperature=0.1, max_tokens=768)
+
 
 def llm_call(prompt: str) -> str:
     """General LLM call — for drafting, reasoning, extraction."""
@@ -102,6 +107,34 @@ def llm_classify_prefill(prompt: str) -> str:
     full     = "1:" + response
     dbg_block(f"LLM CLASSIFY_PREFILL RESPONSE  ({len(full)} chars, {elapsed:.1f}s)", full)
     return full
+
+
+def llm_structured(prompt: str, schema: dict, schema_name: str = "response") -> dict:
+    """
+    Structured-output call: passes a JSON Schema via response_format so the
+    backend (LM Studio / llama.cpp) hard-constrains generation token-by-token
+    to conforming JSON, rather than relying on a "reply with ONLY..."
+    instruction the model is free to ignore — which is the actual cause of
+    bugs like a "single subject line" request coming back as five
+    newline-joined alternatives. Use for any call where the output needs to
+    be machine-parsed (counts, lists, single fields) rather than read by a
+    human. Returns the parsed dict, or {} if the backend doesn't honor the
+    schema or returns malformed JSON.
+    """
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+    }
+    dbg_block(f"LLM STRUCTURED PROMPT  ({len(prompt)} chars)", prompt)
+    t0       = time.time()
+    response = _llm_structured.invoke(prompt, response_format=response_format).content
+    elapsed  = time.time() - t0
+    dbg_block(f"LLM STRUCTURED RESPONSE  ({len(response)} chars, {elapsed:.1f}s)", response)
+    try:
+        return json.loads(response)
+    except Exception:
+        dbg(f"llm_structured: failed to parse JSON response")
+        return {}
 
 
 # =============================================================================

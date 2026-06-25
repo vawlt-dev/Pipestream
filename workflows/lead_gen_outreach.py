@@ -11,12 +11,11 @@
 # =============================================================================
 
 import re
-import json
 
 from core import (
-    llm_call, gather_info, format_answers_as_context,
+    llm_call, llm_structured, gather_info, format_answers_as_context,
     clean_email_draft, clean_subject_line, extract_greeting_name,
-    check_cancelled, extract_field,
+    check_cancelled,
 )
 from research import find_contact_email
 from tools_web import web_search
@@ -36,6 +35,13 @@ WORKFLOW_META = {
     ),
 }
 
+_COMPANY_LIST_SCHEMA = {
+    "type": "object",
+    "properties": {"companies": {"type": "array", "items": {"type": "string"}}},
+    "required": ["companies"],
+    "additionalProperties": False,
+}
+
 
 # =============================================================================
 # MAIN WORKFLOW
@@ -52,35 +58,47 @@ def run(task_id: str, input_text: str, client) -> None:
     # =========================================================================
     log('📝 Parsing request...', 'info')
 
-    parsed = llm_call(
+    parsed = llm_structured(
         f'Extract the following from this request.\n\n'
         f'Request: "{input_text}"\n\n'
-        f'SENDER_NAME: <the person\'s name>\n'
-        f'SENDER_TITLE: <their job title>\n'
-        f'SENDER_COMPANY: <their company name>\n'
-        f'GOAL: <what they want to achieve / who they want to reach, in one line>\n'
-        f'COUNT: <number of companies to find — just the number, default 10>'
+        f'sender_name: the person\'s name\n'
+        f'sender_title: their job title\n'
+        f'sender_company: their company name\n'
+        f'goal: what they want to achieve / who they want to reach, in one line\n'
+        f'count: number of companies to find — just the number, default 10 if not specified',
+        {
+            "type": "object",
+            "properties": {
+                "sender_name":    {"type": "string"},
+                "sender_title":   {"type": "string"},
+                "sender_company": {"type": "string"},
+                "goal":           {"type": "string"},
+                "count":          {"type": "integer"},
+            },
+            "required": ["sender_name", "sender_title", "sender_company", "goal", "count"],
+            "additionalProperties": False,
+        },
+        schema_name="parsed_request",
     )
-    log(f'Parsed:\n{parsed}', 'agent')
+    log(f'Parsed: {parsed}', 'agent')
 
-    sender_name    = extract_field(parsed, 'SENDER_NAME')
-    sender_title   = extract_field(parsed, 'SENDER_TITLE')
-    sender_company = extract_field(parsed, 'SENDER_COMPANY')
-    goal           = extract_field(parsed, 'GOAL')
-    count_str      = extract_field(parsed, 'COUNT')
+    sender_name    = str(parsed.get('sender_name') or '').strip()
+    sender_title   = str(parsed.get('sender_title') or '').strip()
+    sender_company = str(parsed.get('sender_company') or '').strip()
+    goal           = str(parsed.get('goal') or '').strip()
+    target_count   = parsed.get('count')
 
-    count_match = re.search(r'(\d+)', count_str)
-    if not count_match:
-        # The model sometimes drops the COUNT field entirely and folds the
-        # number into GOAL's free text instead. Fall back to scanning the
-        # raw input directly before accepting the silent default of 10.
+    if not isinstance(target_count, int) or target_count <= 0:
+        # Schema marks count as required, but that only enforces type, not
+        # that the model actually found a number in the input — fall back to
+        # scanning the raw input directly before accepting a default of 10.
         count_match = (
             re.search(r'\bfind\s+(\d+)\b', input_text, re.IGNORECASE)
             or re.search(r'\b(\d+)\s+compan', input_text, re.IGNORECASE)
         )
-    target_count = int(count_match.group(1)) if count_match else 10
+        target_count = int(count_match.group(1)) if count_match else 10
 
-    if sender_company.lower() in ('not found', 'not specified'):
+    if not sender_company:
         log("Could not identify the sender's company from the request", 'error')
         client.update_status(task_id, 'failed',
                              error_message="Could not identify your company — please include it in the request.")
@@ -149,23 +167,19 @@ def run(task_id: str, input_text: str, client) -> None:
     # =========================================================================
     log('📋 Extracting candidate companies...', 'info')
 
-    candidates_raw = llm_call(
+    extracted = llm_structured(
         f'From these search results, extract a list of distinct real company names '
         f'that could be prospects for "{sender_company}" (goal: {goal}).\n\n'
         f'Exclude: {sender_company} itself, directory/listing sites, news aggregators, '
         f'generic terms, AND any company that appears to PROVIDE the same or a '
         f'competing service to {sender_company} rather than NEEDING it — those are '
         f'competitors, not prospects, even if they show up prominently in the results.\n\n'
-        f'Search results:\n{combined_results[:10000]}\n\n'
-        f'Reply with ONLY a JSON array of company names, e.g. ["Company A", "Company B"]'
+        f'Search results:\n{combined_results[:10000]}',
+        _COMPANY_LIST_SCHEMA,
+        schema_name="candidate_companies",
     )
-    log(f'Candidates:\n{candidates_raw}', 'agent')
-
-    json_match = re.search(r'\[.*?\]', candidates_raw, re.DOTALL)
-    try:
-        candidate_names = json.loads(json_match.group()) if json_match else []
-    except Exception:
-        candidate_names = []
+    log(f'Candidates: {extracted}', 'agent')
+    candidate_names = extracted.get('companies') or []
 
     seen = set()
     unique_candidates = []
@@ -193,17 +207,14 @@ def run(task_id: str, input_text: str, client) -> None:
     buffer_count = min(len(unique_candidates), target_count + 5)
 
     if len(unique_candidates) > buffer_count:
-        curated_raw = llm_call(
+        extracted = llm_structured(
             f'From this list of candidate companies, select the {buffer_count} best '
-            f'prospects for: {goal}\n\n'
-            f'Candidates:\n' + '\n'.join(f'- {c}' for c in unique_candidates) + '\n\n'
-            f'Reply with ONLY a JSON array of company names, in priority order.'
+            f'prospects for: {goal}, in priority order.\n\n'
+            f'Candidates:\n' + '\n'.join(f'- {c}' for c in unique_candidates),
+            _COMPANY_LIST_SCHEMA,
+            schema_name="curated_companies",
         )
-        json_match = re.search(r'\[.*?\]', curated_raw, re.DOTALL)
-        try:
-            curated = json.loads(json_match.group())
-        except Exception:
-            curated = unique_candidates[:buffer_count]
+        curated = extracted.get('companies') or unique_candidates[:buffer_count]
     else:
         curated = unique_candidates
 
@@ -287,11 +298,19 @@ def run(task_id: str, input_text: str, client) -> None:
             f'Write ONLY the email body:'
         ))
 
-        subject_line = clean_subject_line(llm_call(
+        subject_result = llm_structured(
             f'Write a short email subject line (under 50 characters) for outreach to '
             f'{company_name} about: {angle}\n'
-            f'No emojis, no quotes. Write ONLY the subject line:'
-        ))
+            f'No emojis, no quotes.',
+            {
+                "type": "object",
+                "properties": {"subject": {"type": "string"}},
+                "required": ["subject"],
+                "additionalProperties": False,
+            },
+            schema_name="subject_line",
+        )
+        subject_line = clean_subject_line(str(subject_result.get('subject') or ''))
 
         full_email = (
             f'{greeting},\n\n'
