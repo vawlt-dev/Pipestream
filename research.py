@@ -391,7 +391,7 @@ def find_contact_email(topic: str, task_id: str, client, log) -> str | None:
     result_text = web_search(f"{topic} contact email", max_results=5)
     log(f"Got {len(result_text)} chars", "tool_result")
 
-    match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', result_text)
+    match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', result_text, re.IGNORECASE)
     if match:
         return match.group()
 
@@ -403,5 +403,5 @@ def find_contact_email(topic: str, task_id: str, client, log) -> str | None:
         schema_name="contact_email",
     )
     extracted = (result.get("email") or "").strip()
-    match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', extracted)
+    match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', extracted, re.IGNORECASE)
     return match.group() if match else None

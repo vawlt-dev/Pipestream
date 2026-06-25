@@ -287,7 +287,7 @@ confidence: high, medium, or low"""
             )
             draft_body = str(draft_result.get('body') or '')
 
-            email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender)
+            email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender, re.IGNORECASE)
             reply_to    = email_match.group() if email_match else sender
             full_reply  = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
 
@@ -423,7 +423,7 @@ confidence: high, medium, or low"""
             )
             draft_body = str(draft_result.get('body') or '')
 
-            email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender)
+            email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender, re.IGNORECASE)
             reply_to    = email_match.group() if email_match else sender
             full_reply  = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
 
