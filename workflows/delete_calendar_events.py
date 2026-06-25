@@ -11,11 +11,18 @@ import re
 import dateparser
 from datetime import datetime, timezone, timedelta
 
-from core import (
-    llm_call, llm_classify_prefill,
-    wait_for_input, check_cancelled, extract_field,
-)
+from core import llm_structured, wait_for_input, check_cancelled
+from schemas import s_object, s_string, s_enum, s_array
 from tools_google import search_calendar_events, delete_calendar_event
+
+_TIME_THEME_SCHEMA = s_object({"time_description": s_string(), "theme": s_string()})
+
+_EVENT_MATCH_SCHEMA = s_object({
+    "matches": s_array(s_object({
+        "verdict": s_enum(["DELETE", "KEEP", "UNSURE"]),
+        "reason":  s_string(),
+    })),
+})
 
 WORKFLOW_META = {
     "name": "delete_calendar_events",
@@ -158,16 +165,18 @@ def run(task_id: str, input_text: str, client) -> None:
     # =========================================================================
     log('🔍 Extracting search parameters...', 'info')
 
-    intent = llm_call(
+    intent = llm_structured(
         f'Extract the time range and theme from this calendar delete request.\n\n'
         f'Request: "{input_text}"\n\n'
-        f'TIME_DESCRIPTION: <the time part, e.g. "last week", "June", "this Thursday", or "not specified">\n'
-        f'THEME: <what kind of events to delete, e.g. "physio", "meetings with Jason", "all events">'
+        f'time_description: the time part, e.g. "last week", "June", "this Thursday", or "not specified"\n'
+        f'theme: what kind of events to delete, e.g. "physio", "meetings with Jason", "all events"',
+        _TIME_THEME_SCHEMA,
+        schema_name="delete_intent",
     )
-    log(f'Intent:\n{intent}', 'agent')
+    log(f'Intent: {intent}', 'agent')
 
-    time_desc = extract_field(intent, 'TIME_DESCRIPTION')
-    theme     = extract_field(intent, 'THEME')
+    time_desc = str(intent.get('time_description') or 'not specified').strip()
+    theme     = str(intent.get('theme') or 'all events').strip()
 
     # Use the raw input as fallback for time parsing
     time_input = time_desc if time_desc.lower() not in ('not found', 'not specified') else input_text
@@ -206,30 +215,24 @@ def run(task_id: str, input_text: str, client) -> None:
 
     event_list_str = _format_event_list(events)
 
-    match_output = llm_classify_prefill(
+    match_result = llm_structured(
         f'The user wants to delete calendar events related to: "{theme}"\n\n'
         f'Events:\n{event_list_str}\n\n'
-        f'Mark each event DELETE, KEEP, or UNSURE.\n'
-        f'UNSURE: use when you cannot confidently tell if it matches — add a short reason.\n'
-        f'Reply with one line per event in the format:\n'
-        f'  N: DELETE\n'
-        f'  N: KEEP\n'
-        f'  N: UNSURE — <reason>'
+        f'For each event, in the same order as listed, give a verdict: DELETE, KEEP, '
+        f'or UNSURE (use UNSURE when you cannot confidently tell if it matches). '
+        f'Give a short reason — required for UNSURE, empty string is fine for DELETE/KEEP.',
+        _EVENT_MATCH_SCHEMA,
+        schema_name="event_matches",
     )
-    log(f'Match results:\n{match_output}', 'agent')
+    log(f'Match results: {match_result}', 'agent')
+    matches = match_result.get('matches') or []
 
     to_delete: list[dict] = []
     unsure:    list[tuple[dict, str]] = []   # (event, reason)
 
-    for i, event in enumerate(events, 1):
-        line_match = re.search(
-            rf'\b{i}[.:\s]+\s*(DELETE|KEEP|UNSURE)(.*)',
-            match_output, re.IGNORECASE
-        )
-        if not line_match:
-            continue
-        verdict = line_match.group(1).upper()
-        reason  = line_match.group(2).lstrip(' —-').strip()
+    for event, match in zip(events, matches):
+        verdict = str(match.get('verdict') or '').upper()
+        reason  = str(match.get('reason') or '').strip()
 
         if verdict == 'DELETE':
             to_delete.append(event)

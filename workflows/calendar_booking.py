@@ -13,9 +13,19 @@ import re
 import dateparser
 from datetime import timedelta
 
-from core import llm_call, wait_for_input, check_cancelled, extract_field, parse_duration
+from core import llm_structured, wait_for_input, check_cancelled, parse_duration
+from schemas import s_object, s_string, s_bool
 
 from tools_google import create_calendar_event
+
+_PARSED_BOOKING_SCHEMA = s_object({
+    "event_name": s_string(),
+    "date_time":  s_string(),
+    "duration":   s_string(),
+    "location":   s_string(),
+})
+
+_CONFIRMATION_SCHEMA = s_object({"confirmed": s_bool()})
 
 WORKFLOW_META = {
     "name": "calendar_booking",
@@ -111,27 +121,24 @@ def run(task_id: str, input_text: str, client) -> None:
 
 Request: "{input_text}"
 
-Respond in this exact format:
-EVENT_NAME: <name of the event or appointment>
-DATE_TIME: <date and time exactly as stated, e.g. "next Monday at 3pm">
-DURATION: <duration if stated, e.g. "1 hour", "30 minutes", or "not specified">
-LOCATION: <location if stated, or "not specified">
+event_name: name of the event or appointment, or "not found"
+date_time: date and time exactly as stated, e.g. "next Monday at 3pm", or "not found"
+duration: duration if stated, e.g. "1 hour", "30 minutes", or "not specified"
+location: location if stated, or "not specified" """
 
-Now parse the request:"""
-
-        parsed        = llm_call(parse_prompt)
+        parsed = llm_structured(parse_prompt, _PARSED_BOOKING_SCHEMA, schema_name="parsed_booking")
         log(f"Parsed: {parsed}", "agent")
         if check_cancelled(task_id, client):
             return
 
-        event_name     = extract_field(parsed, "EVENT_NAME")
-        date_time_text = extract_field(parsed, "DATE_TIME")
-        duration_str   = extract_field(parsed, "DURATION")
-        location_str   = extract_field(parsed, "LOCATION")
+        event_name     = str(parsed.get("event_name") or "").strip()
+        date_time_text = str(parsed.get("date_time") or "").strip()
+        duration_str   = str(parsed.get("duration") or "").strip()
+        location_str   = str(parsed.get("location") or "").strip()
 
-        if event_name.lower() == "not found":
+        if not event_name or event_name.lower() == "not found":
             event_name = "Appointment"
-        location      = "" if location_str.lower() in ("not found", "not specified") else location_str
+        location      = "" if location_str.lower() in ("not found", "not specified", "") else location_str
         duration_mins = parse_duration(duration_str)
 
         # =====================================================================
@@ -191,8 +198,12 @@ Now parse the request:"""
         # =====================================================================
         # STEP 4: Check if confirmed or a correction
         # =====================================================================
-        is_yes_prompt = f'Is this response a "yes" or confirmation?\nResponse: "{answer}"\nReply with only YES or NO:'
-        is_confirmed  = "YES" in llm_call(is_yes_prompt).upper()
+        confirm_result = llm_structured(
+            f'Is this response a "yes" or confirmation?\nResponse: "{answer}"',
+            _CONFIRMATION_SCHEMA,
+            schema_name="booking_confirmation",
+        )
+        is_confirmed = bool(confirm_result.get("confirmed"))
 
         if is_confirmed:
             log("✅ Confirmed — creating event", "success")

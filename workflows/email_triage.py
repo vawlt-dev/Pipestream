@@ -11,10 +11,11 @@ import re
 import dateparser
 
 from core import (
-    llm_call, llm_classify_prefill,
-    wait_for_input, check_cancelled, extract_field,
+    llm_structured,
+    wait_for_input, check_cancelled,
     SENDER_NAME, SENDER_TITLE, SENDER_WEBSITE,
 )
+from schemas import s_object, s_string, s_enum, s_array
 from tools_google import get_recent_emails, get_thread_text, send_reply
 
 WORKFLOW_META = {
@@ -31,46 +32,26 @@ WORKFLOW_META = {
 
 ACTIONS = ("reply_needed", "book_appointment", "reply_and_book", "fyi", "handled")
 
+_CLASSIFICATION_SCHEMA = s_object({"classifications": s_array(s_enum(list(ACTIONS)))})
 
-# =============================================================================
-# HELPERS
-# =============================================================================
+_BOOKING_EXTRACT_SCHEMA = s_object({
+    "event_name": s_string(),
+    "date_time":  s_string(),
+    "duration":   s_string(),
+    "location":   s_string(),
+    "confidence": s_enum(["high", "medium", "low"]),
+})
 
-def _parse_classifications(llm_output: str, count: int) -> list[str]:
-    """
-    Parse classification output robustly.
+_CLARIFICATION_EXTRACT_SCHEMA = s_object({
+    "event_name": s_string(),
+    "date_time":  s_string(),
+    "duration":   s_string(),
+})
 
-    Handles clean format:
-        1: reply_needed
-    And verbose/grouped formats the model sometimes produces:
-        1: Blake Collins - reply_needed (reason)
-        3, 4, 5: idle2112 - book_appointment
-    """
-    number_to_action: dict[int, str] = {}
+_REPLY_INTENT_SCHEMA = s_object({"action": s_enum(["YES", "SKIP", "EDIT"])})
+_DRAFT_BODY_SCHEMA   = s_object({"body": s_string()})
 
-    for line in llm_output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        # Split on first colon — everything before is the number(s)
-        if ':' not in line:
-            continue
-        left, right = line.split(':', 1)
-
-        # Extract all numbers from the left side (handles "3, 4, 5")
-        nums = [int(n) for n in re.findall(r'\d+', left) if 1 <= int(n) <= count]
-        if not nums:
-            continue
-
-        # Scan the right side for any action keyword
-        right_lower = right.lower()
-        action = next((a for a in ACTIONS if a in right_lower), 'fyi')
-
-        for n in nums:
-            number_to_action[n] = action
-
-    return [number_to_action.get(i, 'fyi') for i in range(1, count + 1)]
+_NOT_SPECIFIED = ('not found', 'not specified', '')
 
 
 # =============================================================================
@@ -121,14 +102,15 @@ handled: already replied or no action needed.
 
 {lines}
 
-Reply with one line per email in the format   N: action"""
+List the action for each email above, in the same order."""
 
-    classification_output = llm_classify_prefill(classify_prompt)
-    log(f'Classifications:\n{classification_output}', 'agent')
+    classification_result = llm_structured(classify_prompt, _CLASSIFICATION_SCHEMA, schema_name="email_classifications")
+    log(f'Classifications: {classification_result}', 'agent')
 
-    actions = _parse_classifications(classification_output, len(emails))
+    classifications = classification_result.get('classifications') or []
+    actions = list(classifications[:len(emails)]) + ['fyi'] * max(0, len(emails) - len(classifications))
     for email, action in zip(emails, actions):
-        email['action'] = action
+        email['action'] = action if action in ACTIONS else 'fyi'
 
     tally = {a: 0 for a in ACTIONS}
     for e in emails:
@@ -193,22 +175,21 @@ Reply with one line per email in the format   N: action"""
 Thread:
 {thread_text}
 
-Respond in this exact format:
-EVENT_NAME: <what is being booked>
-DATE_TIME: <date and time as stated>
-DURATION: <if mentioned, or "not specified">
-LOCATION: <if mentioned, or "not specified">
-CONFIDENCE: <high/medium/low>"""
+event_name: what is being booked, or "not found"
+date_time: date and time as stated, or "not found"
+duration: if mentioned, or "not specified"
+location: if mentioned, or "not specified"
+confidence: high, medium, or low"""
 
-            extracted     = llm_call(extract_prompt)
-            log(f'Extracted:\n{extracted}', 'agent')
+            extracted     = llm_structured(extract_prompt, _BOOKING_EXTRACT_SCHEMA, schema_name="booking_extract")
+            log(f'Extracted: {extracted}', 'agent')
 
-            event_name    = extract_field(extracted, 'EVENT_NAME')
-            date_time_str = extract_field(extracted, 'DATE_TIME')
-            duration_str  = extract_field(extracted, 'DURATION')
-            location_str  = extract_field(extracted, 'LOCATION')
+            event_name    = str(extracted.get('event_name') or '').strip()
+            date_time_str = str(extracted.get('date_time') or '').strip()
+            duration_str  = str(extracted.get('duration') or '').strip()
+            location_str  = str(extracted.get('location') or '').strip()
 
-            location      = '' if location_str.lower() in ('not found', 'not specified') else location_str
+            location      = '' if location_str.lower() in _NOT_SPECIFIED else location_str
 
             from core import parse_duration
             duration_mins = parse_duration(duration_str)
@@ -216,12 +197,12 @@ CONFIDENCE: <high/medium/low>"""
             dt = dateparser.parse(
                 date_time_str,
                 settings={'PREFER_DATES_FROM': 'future', 'RETURN_AS_TIMEZONE_AWARE': False},
-            ) if date_time_str.lower() not in ('not found', 'not specified') else None
+            ) if date_time_str.lower() not in _NOT_SPECIFIED else None
 
             missing = []
             if not dt:
                 missing.append('date and time')
-            if event_name.lower() in ('not found', 'not specified'):
+            if event_name.lower() in _NOT_SPECIFIED:
                 missing.append('event name')
 
             if missing:
@@ -241,17 +222,19 @@ CONFIDENCE: <high/medium/low>"""
                     skipped += 1
                     continue
 
-                re_extract    = llm_call(
+                re_extract = llm_structured(
                     f'Extract booking details from this clarification.\n'
                     f'Clarification: "{answer}"\n'
                     f'Original context: {event_name}, {date_time_str}\n\n'
-                    f'EVENT_NAME: <event name>\n'
-                    f'DATE_TIME: <date and time>\n'
-                    f'DURATION: <duration or "not specified">'
+                    f'event_name: the event name\n'
+                    f'date_time: the date and time\n'
+                    f'duration: the duration, or "not specified"',
+                    _CLARIFICATION_EXTRACT_SCHEMA,
+                    schema_name="booking_clarification",
                 )
-                event_name    = extract_field(re_extract, 'EVENT_NAME') or event_name
-                date_time_str = extract_field(re_extract, 'DATE_TIME')
-                duration_mins = parse_duration(extract_field(re_extract, 'DURATION'))
+                event_name    = str(re_extract.get('event_name') or '').strip() or event_name
+                date_time_str = str(re_extract.get('date_time') or '').strip()
+                duration_mins = parse_duration(str(re_extract.get('duration') or ''))
                 dt = dateparser.parse(
                     date_time_str,
                     settings={'PREFER_DATES_FROM': 'future', 'RETURN_AS_TIMEZONE_AWARE': False},
@@ -291,15 +274,18 @@ CONFIDENCE: <high/medium/low>"""
         elif action == 'reply_needed':
             log(f'✍️  Drafting reply to {sender}...', 'info')
 
-            draft_body = llm_call(
+            draft_result = llm_structured(
                 f'Draft a reply to this email thread on behalf of {SENDER_NAME}.\n\n'
                 f'Thread:\n{thread_text}\n\n'
                 f'Guidelines:\n'
                 f'- Match the tone and formality of the conversation\n'
                 f'- Be concise — answer what is being asked, nothing extra\n'
                 f'- Do NOT include a greeting or sign-off\n\n'
-                f'Write ONLY the reply body:'
+                f'body: the reply body only',
+                _DRAFT_BODY_SCHEMA,
+                schema_name="reply_draft",
             )
+            draft_body = str(draft_result.get('body') or '')
 
             email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender)
             reply_to    = email_match.group() if email_match else sender
@@ -315,21 +301,26 @@ CONFIDENCE: <high/medium/low>"""
             if not answer:
                 return
 
-            intent = llm_classify_prefill(
-                f'Classify this as YES, SKIP, or EDIT:\n"{answer}"\n\n'
-                f'Reply with one line:  1: YES  or  1: SKIP  or  1: EDIT'
-            ).upper()
+            intent_result = llm_structured(
+                f'Classify this as YES, SKIP, or EDIT:\n"{answer}"',
+                _REPLY_INTENT_SCHEMA,
+                schema_name="reply_intent",
+            )
+            intent = str(intent_result.get('action') or '').upper()
 
-            if 'EDIT' in intent:
+            if intent == 'EDIT':
                 log(f'Re-drafting with edits...', 'info')
-                draft_body = llm_call(
+                draft_result = llm_structured(
                     f'Rewrite this email reply based on the instructions.\n\n'
                     f'Original:\n{draft_body}\n\n'
                     f'Instructions: {answer}\n\n'
-                    f'Write ONLY the revised body:'
+                    f'body: the revised body only',
+                    _DRAFT_BODY_SCHEMA,
+                    schema_name="reply_draft_revision",
                 )
+                draft_body = str(draft_result.get('body') or '')
                 full_reply = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
-            elif 'YES' not in intent:
+            elif intent != 'YES':
                 log(f'Skipped reply to {sender}', 'info')
                 skipped += 1
                 continue
@@ -361,33 +352,34 @@ CONFIDENCE: <high/medium/low>"""
             from core import parse_duration
             import importlib.util, os as _os
 
-            extracted = llm_call(
+            extracted = llm_structured(
                 f'Extract booking details from this email thread.\n\n'
                 f'Thread:\n{thread_text}\n\n'
-                f'Respond in this exact format:\n'
-                f'EVENT_NAME: <what is being booked>\n'
-                f'DATE_TIME: <date and time as stated>\n'
-                f'DURATION: <if mentioned, or "not specified">\n'
-                f'LOCATION: <if mentioned, or "not specified">\n'
-                f'CONFIDENCE: <high/medium/low>'
+                f'event_name: what is being booked, or "not found"\n'
+                f'date_time: date and time as stated, or "not found"\n'
+                f'duration: if mentioned, or "not specified"\n'
+                f'location: if mentioned, or "not specified"\n'
+                f'confidence: high, medium, or low',
+                _BOOKING_EXTRACT_SCHEMA,
+                schema_name="booking_extract",
             )
-            log(f'Extracted:\n{extracted}', 'agent')
+            log(f'Extracted: {extracted}', 'agent')
 
-            event_name    = extract_field(extracted, 'EVENT_NAME')
-            date_time_str = extract_field(extracted, 'DATE_TIME')
-            duration_str  = extract_field(extracted, 'DURATION')
-            location_str  = extract_field(extracted, 'LOCATION')
-            location      = '' if location_str.lower() in ('not found', 'not specified') else location_str
+            event_name    = str(extracted.get('event_name') or '').strip()
+            date_time_str = str(extracted.get('date_time') or '').strip()
+            duration_str  = str(extracted.get('duration') or '').strip()
+            location_str  = str(extracted.get('location') or '').strip()
+            location      = '' if location_str.lower() in _NOT_SPECIFIED else location_str
             duration_mins = parse_duration(duration_str)
 
             dt = dateparser.parse(
                 date_time_str,
                 settings={'PREFER_DATES_FROM': 'future', 'RETURN_AS_TIMEZONE_AWARE': False},
-            ) if date_time_str.lower() not in ('not found', 'not specified') else None
+            ) if date_time_str.lower() not in _NOT_SPECIFIED else None
 
             # Book the event if details are complete
             booking_note = ''
-            if dt and event_name.lower() not in ('not found', 'not specified'):
+            if dt and event_name.lower() not in _NOT_SPECIFIED:
                 spec = importlib.util.spec_from_file_location(
                     'calendar_booking',
                     _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'calendar_booking.py')
@@ -417,7 +409,7 @@ CONFIDENCE: <high/medium/low>"""
 
             # Draft reply (mentioning the booking if it happened)
             log(f'✍️  Drafting reply to {sender}...', 'info')
-            draft_body = llm_call(
+            draft_result = llm_structured(
                 f'Draft a reply to this email thread on behalf of {SENDER_NAME}.\n\n'
                 f'Thread:\n{thread_text}\n\n'
                 + (f'Note: {booking_note} Mention that the meeting is confirmed.\n\n' if booking_note else '')
@@ -425,8 +417,11 @@ CONFIDENCE: <high/medium/low>"""
                 f'- Match the tone and formality of the conversation\n'
                 f'- Be concise — answer what is being asked, nothing extra\n'
                 f'- Do NOT include a greeting or sign-off\n\n'
-                f'Write ONLY the reply body:'
+                f'body: the reply body only',
+                _DRAFT_BODY_SCHEMA,
+                schema_name="reply_draft",
             )
+            draft_body = str(draft_result.get('body') or '')
 
             email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender)
             reply_to    = email_match.group() if email_match else sender
@@ -442,21 +437,26 @@ CONFIDENCE: <high/medium/low>"""
             if not answer:
                 return
 
-            intent = llm_classify_prefill(
-                f'Classify this as YES, SKIP, or EDIT:\n"{answer}"\n\n'
-                f'Reply with one line:  1: YES  or  1: SKIP  or  1: EDIT'
-            ).upper()
+            intent_result = llm_structured(
+                f'Classify this as YES, SKIP, or EDIT:\n"{answer}"',
+                _REPLY_INTENT_SCHEMA,
+                schema_name="reply_intent",
+            )
+            intent = str(intent_result.get('action') or '').upper()
 
-            if 'EDIT' in intent:
+            if intent == 'EDIT':
                 log(f'Re-drafting with edits...', 'info')
-                draft_body = llm_call(
+                draft_result = llm_structured(
                     f'Rewrite this email reply based on the instructions.\n\n'
                     f'Original:\n{draft_body}\n\n'
                     f'Instructions: {answer}\n\n'
-                    f'Write ONLY the revised body:'
+                    f'body: the revised body only',
+                    _DRAFT_BODY_SCHEMA,
+                    schema_name="reply_draft_revision",
                 )
+                draft_body = str(draft_result.get('body') or '')
                 full_reply = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
-            elif 'YES' not in intent:
+            elif intent != 'YES':
                 log(f'Skipped reply to {sender}', 'info')
                 skipped += 1
                 continue

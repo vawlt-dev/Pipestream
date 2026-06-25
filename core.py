@@ -2,16 +2,17 @@
 # core.py — Shared helpers available to all workflows
 # =============================================================================
 # Import from here in any workflow file:
-#   from core import llm_call, gather_info, wait_for_input, ...
+#   from core import llm_structured, gather_info, wait_for_input, ...
 # =============================================================================
 
 import os
 import re
+import json
 import time
 from datetime import datetime
 
+import jsonschema
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage
 
 # Sender identity — set in .env
 SENDER_NAME    = os.getenv("SENDER_NAME", "")
@@ -51,15 +52,23 @@ _BASE_KWARGS = dict(
     api_key = os.getenv("OPENAI_API_KEY", "not-needed"),
 )
 
-# General-purpose LLM — creative, longer responses
+# General-purpose LLM — creative, longer responses. Used directly only by
+# schemas.llm_generate_schema()'s escape hatch, which needs raw text (it's
+# generating a schema, so there's no schema yet to constrain it with).
 _llm = ChatOpenAI(**_BASE_KWARGS, temperature=0.7)
 
-# Classification LLM — low temperature, hard token cap so it can't ramble
-_llm_classify = ChatOpenAI(**_BASE_KWARGS, temperature=0.1, max_tokens=512)
+# Structured-output LLM — low temperature, used only with a JSON Schema
+# response_format (see llm_structured below)
+_llm_structured = ChatOpenAI(**_BASE_KWARGS, temperature=0.1, max_tokens=768)
 
 
 def llm_call(prompt: str) -> str:
-    """General LLM call — for drafting, reasoning, extraction."""
+    """
+    Raw LLM call returning free text — no schema enforcement. Only used by
+    schemas.llm_generate_schema(), which needs unconstrained text because
+    its whole job is producing a schema for some *other* call to use. Every
+    workflow LLM call should go through llm_structured() below instead.
+    """
     dbg_block(f"LLM PROMPT  ({len(prompt)} chars)", prompt)
     t0       = time.time()
     response = _llm.invoke(prompt).content
@@ -68,40 +77,39 @@ def llm_call(prompt: str) -> str:
     return response
 
 
-_CLASSIFY_PREAMBLE = (
-    "Output ONLY the exact format requested. "
-    "No explanations, no reasoning, no extra text.\n\n"
-)
-
-
-def llm_classify(prompt: str) -> str:
-    """Classification LLM call — constraint preamble + token cap keeps output tight."""
-    full_prompt = _CLASSIFY_PREAMBLE + prompt
-    dbg_block(f"LLM CLASSIFY PROMPT  ({len(full_prompt)} chars)", full_prompt)
-    t0       = time.time()
-    response = _llm_classify.invoke(full_prompt).content
-    elapsed  = time.time() - t0
-    dbg_block(f"LLM CLASSIFY RESPONSE  ({len(response)} chars, {elapsed:.1f}s)", response)
-    return response
-
-
-def llm_classify_prefill(prompt: str) -> str:
+def llm_structured(prompt: str, schema: dict, schema_name: str = "response") -> dict:
     """
-    Classification call with constraint preamble + assistant prefill '1:'.
-    Preamble suppresses prose, prefill forces structured numbered output
-    from the first token. Only user/assistant roles used — compatible with
-    Mistral and other models that don't support system role.
-    Returns the full output including the prefilled '1:'.
+    Structured-output call: passes a JSON Schema via response_format so the
+    backend (LM Studio / llama.cpp) hard-constrains generation token-by-token
+    to conforming JSON, rather than relying on a "reply with ONLY..."
+    instruction the model is free to ignore — which is the actual cause of
+    bugs like a "single subject line" request coming back as five
+    newline-joined alternatives. Use for any call where the output needs to
+    be machine-parsed (counts, lists, single fields) rather than read by a
+    human. Returns the parsed dict, or {} if the backend doesn't honor the
+    schema or returns malformed JSON.
+
+    The schema itself is validated against the JSON Schema meta-schema
+    before being sent — a malformed hand-built schema is a coding bug at the
+    call site, and failing fast here is cheaper than burning an LLM call on
+    a schema that LM Studio will silently reject or fall back from.
     """
-    full_prompt = _CLASSIFY_PREAMBLE + prompt
-    dbg_block(f"LLM CLASSIFY_PREFILL PROMPT  ({len(full_prompt)} chars)", full_prompt)
+    jsonschema.Draft202012Validator.check_schema(schema)
+
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+    }
+    dbg_block(f"LLM STRUCTURED PROMPT  ({len(prompt)} chars)", prompt)
     t0       = time.time()
-    messages = [HumanMessage(content=full_prompt), AIMessage(content="1:")]
-    response = _llm_classify.invoke(messages).content
+    response = _llm_structured.invoke(prompt, response_format=response_format).content
     elapsed  = time.time() - t0
-    full     = "1:" + response
-    dbg_block(f"LLM CLASSIFY_PREFILL RESPONSE  ({len(full)} chars, {elapsed:.1f}s)", full)
-    return full
+    dbg_block(f"LLM STRUCTURED RESPONSE  ({len(response)} chars, {elapsed:.1f}s)", response)
+    try:
+        return json.loads(response)
+    except Exception:
+        dbg(f"llm_structured: failed to parse JSON response")
+        return {}
 
 
 # =============================================================================
@@ -116,12 +124,6 @@ def check_cancelled(task_id: str, client) -> bool:
         dbg(f"check_cancelled → TRUE  (status={status})")
         return True
     return False
-
-
-def extract_field(text: str, field: str) -> str:
-    """Pull a labelled field from LLM-structured output."""
-    match = re.search(rf"{field}:\s*(.+)", text, re.IGNORECASE)
-    return match.group(1).strip() if match else "not found"
 
 
 def parse_duration(duration_str: str) -> int:
@@ -199,7 +201,7 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
 # deep-dive. gather_info() is the orchestration entry point; it owns no cache
 # access directly (research.answer_question() does) and does a deferred
 # import of research.py to avoid a circular import (research.py imports core
-# for llm_call/extract_field/etc).
+# for llm_structured/check_cancelled/etc).
 
 def format_answers_as_context(result: dict) -> str:
     """
