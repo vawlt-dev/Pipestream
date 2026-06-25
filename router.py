@@ -93,6 +93,7 @@ Request: "{input_text}"
 Reply with ONLY the workflow name (e.g. business_intro) or "unknown":"""
 
     result = llm_call(prompt).strip().lower().strip('"').strip("'")
+    result = result.replace('\\', '')  # Mistral sometimes markdown-escapes underscores as \_
 
     for name in registry:
         if name in result:

@@ -17,8 +17,17 @@ services:
       - .env
     
     # Mount workspace for credentials and output
+    # Mount source files so code changes are live without rebuilding
     volumes:
       - ./workspace:/workspace
+      - ./workflows:/app/workflows
+      - ./core.py:/app/core.py
+      - ./memory.py:/app/memory.py
+      - ./research.py:/app/research.py
+      - ./router.py:/app/router.py
+      - ./tools_google.py:/app/tools_google.py
+      - ./tools_web.py:/app/tools_web.py
+      - ./agent_worker.py:/app/agent_worker.py
     
     # Allow connecting to LM Studio on host
     extra_hosts:

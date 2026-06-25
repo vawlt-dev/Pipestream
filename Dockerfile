@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY agent_worker.py .
 COPY router.py .
 COPY core.py .
+COPY memory.py .
+COPY research.py .
 COPY tools_web.py .
 COPY tools_google.py .
 COPY workflows/ ./workflows/

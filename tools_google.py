@@ -81,13 +81,56 @@ def send_email(to: str, subject: str, body: str) -> str:
         ).execute()
         
         return f"✅ Email sent to {to} (ID: {sent['id']})"
-    
+
     except FileNotFoundError as e:
         return f"❌ Auth error: {str(e)}"
     except Exception as e:
         return f"❌ Failed to send email: {str(e)}"
 
-def get_emails(max_results: int = 500) -> list[dict]:
+
+def create_email_draft(to: str, subject: str, body: str) -> str:
+    """
+    Create a Gmail draft — does NOT send. Visible in the Drafts folder for
+    the user to review, edit, and send manually.
+
+    Returns:
+        Success or error message
+    """
+    try:
+        creds   = get_google_credentials()
+        service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
+
+        message = MIMEText(body)
+        message['to']      = to
+        message['subject'] = subject
+
+        raw   = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        draft = service.users().drafts().create(
+            userId='me',
+            body={'message': {'raw': raw}},
+        ).execute()
+
+        return f"✅ Draft created for {to} (ID: {draft['id']})"
+
+    except FileNotFoundError as e:
+        return f"❌ Auth error: {str(e)}"
+    except Exception as e:
+        return f"❌ Failed to create draft: {str(e)}"
+
+
+def get_recent_emails(max_results: int = 10) -> list[dict]:
+    """
+    Fetch the most recent non-promotional inbox emails.
+    Uses Gmail's built-in category filtering to exclude Promotions, Updates,
+    and Social tabs — no LLM filter pass required.
+
+    Returns the same dict shape as get_emails().
+    """
+    return get_emails(max_results=max_results,
+                      query='in:inbox -category:promotions -category:updates -category:social')
+
+
+def get_emails(max_results: int = 500, query: str = '') -> list[dict]:
     """
     Fetch emails from inbox with metadata only (no full bodies).
     Parallelises the per-message metadata calls for speed.
@@ -101,11 +144,12 @@ def get_emails(max_results: int = 500) -> list[dict]:
     service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
 
     # Step 1: get message ID stubs (single API call)
-    response = service.users().messages().list(
-        userId='me',
-        maxResults=max_results,
-        labelIds=['INBOX'],
-    ).execute()
+    list_kwargs = dict(userId='me', maxResults=max_results)
+    if query:
+        list_kwargs['q'] = query
+    else:
+        list_kwargs['labelIds'] = ['INBOX']
+    response = service.users().messages().list(**list_kwargs).execute()
 
     stubs = response.get('messages', [])
     if not stubs:
@@ -151,16 +195,31 @@ def get_emails(max_results: int = 500) -> list[dict]:
     return results
 
 
-def _extract_body(payload: dict) -> str:
-    """Recursively pull plain-text body from a Gmail message payload."""
-    if payload.get('mimeType') == 'text/plain':
+def _extract_mime(payload: dict, mime_type: str) -> str:
+    """Recursively find the first part matching mime_type and return its decoded text."""
+    if payload.get('mimeType') == mime_type:
         data = payload.get('body', {}).get('data', '')
-        if data:
-            return base64.urlsafe_b64decode(data).decode('utf-8', errors='replace')
+        return base64.urlsafe_b64decode(data).decode('utf-8', errors='replace') if data else ''
     for part in payload.get('parts', []):
-        text = _extract_body(part)
-        if text:
-            return text
+        result = _extract_mime(part, mime_type)
+        if result:
+            return result
+    return ''
+
+
+def _extract_body(payload: dict) -> str:
+    """
+    Recursively pull readable text from a Gmail message payload.
+    Prefers text/plain; falls back to text/html with tags stripped.
+    """
+    import re as _re
+    plain = _extract_mime(payload, 'text/plain')
+    if plain:
+        return plain
+    html = _extract_mime(payload, 'text/html')
+    if html:
+        text = _re.sub(r'<[^>]+>', ' ', html)
+        return _re.sub(r'\s+', ' ', text).strip()
     return ''
 
 
@@ -250,9 +309,66 @@ def create_calendar_event(summary: str, start_time: str, end_time: str,
         
         event = service.events().insert(calendarId='primary', body=event).execute()
         return f"✅ Event created: {event.get('summary')}\n   Link: {event.get('htmlLink')}"
-    
+
     except Exception as e:
         return f"❌ Failed to create event: {str(e)}"
+
+def search_calendar_events(query: str = '', time_min: str = '', time_max: str = '',
+                           max_results: int = 50) -> list[dict]:
+    """
+    Search calendar events within an optional time range.
+
+    Returns a list of dicts:
+        id, summary, start, end, location, description, html_link
+    """
+    try:
+        creds   = get_google_credentials()
+        service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
+
+        kwargs = dict(
+            calendarId  = 'primary',
+            maxResults  = max_results,
+            singleEvents= True,
+            orderBy     = 'startTime',
+        )
+        if query:
+            kwargs['q'] = query
+        if time_min:
+            kwargs['timeMin'] = time_min
+        if time_max:
+            kwargs['timeMax'] = time_max
+
+        result = service.events().list(**kwargs).execute()
+        events = []
+        for e in result.get('items', []):
+            start = e.get('start', {})
+            end   = e.get('end', {})
+            events.append({
+                'id':          e['id'],
+                'summary':     e.get('summary', '(no title)'),
+                'start':       start.get('dateTime', start.get('date', '')),
+                'end':         end.get('dateTime',   end.get('date', '')),
+                'location':    e.get('location', ''),
+                'description': e.get('description', ''),
+                'html_link':   e.get('htmlLink', ''),
+            })
+        return events
+
+    except Exception as e:
+        print(f"  [CALENDAR SEARCH ERROR] {e}", flush=True)
+        return []
+
+
+def delete_calendar_event(event_id: str) -> str:
+    """Delete a calendar event by ID. Returns a status string."""
+    try:
+        creds   = get_google_credentials()
+        service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
+        service.events().delete(calendarId='primary', eventId=event_id).execute()
+        return f'✅ Deleted event {event_id}'
+    except Exception as e:
+        return f'❌ Failed to delete {event_id}: {e}'
+
 
 # =============================================================================
 # TEST

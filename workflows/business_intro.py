@@ -10,10 +10,12 @@
 
 import re
 from core import (
-    llm_call, gather_info, select_research_depth,
+    llm_call, gather_info, format_answers_as_context,
+    clean_email_draft, clean_subject_line, extract_greeting_name,
     wait_for_input, check_cancelled, extract_field,
     SENDER_NAME, SENDER_TITLE, SENDER_WEBSITE, SENDER_BIO,
 )
+from research import find_contact_email
 from tools_google import send_email
 
 WORKFLOW_META = {
@@ -82,37 +84,39 @@ Now parse the request:"""
     # =========================================================================
     # STEP 2: Gather information
     # =========================================================================
-    depth = select_research_depth(
-        company_name,
-        context=f"Writing a personalized intro email to {company_name}. Task: {input_text}"
-    )
-    log(f"Step 2: Gathering info (depth: {depth})...", "info")
+    log("Step 2: Gathering info...", "info")
 
-    info = gather_info(company_name, depth, task_id, client, log)
+    info = gather_info(
+        company_name, "prospect", task_id, client, log,
+        context=f"Writing a personalized intro email to {company_name}. Task: {input_text}",
+    )
     if not info:
         return  # cancelled mid-research
 
-    company_summary = info["summary"]
-    recent_news     = info["key_facts"]
-    key_person      = info["key_people"]
-    found_contact   = info["contact_info"]
-    confidence      = info["confidence"]
+    research_context = format_answers_as_context(info)
 
-    # Extract email from contact_info if not already provided
-    if not target_email and found_contact and found_contact.lower() != "none found":
-        email_match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', found_contact)
-        if email_match:
-            target_email = email_match.group()
+    # Best-effort — only available if Q3 (stakeholders) happened to be one of
+    # the 3 questions selected for this topic. Falls back to a generic
+    # greeting in STEP 4 if not.
+    key_person = next(
+        (a["answer"] for a in info["answers"] if a["question_id"] == "Q3" and a["was_answered"]),
+        "not found",
+    )
+
+    if not target_email:
+        log("🔍 Looking for a contact email...", "info")
+        target_email = find_contact_email(company_name, task_id, client, log)
+        if target_email:
             log(f"Found email from research: {target_email}", "success")
 
     if not target_email:
         log("No email address found or provided", "error")
         client.update_status(task_id, "failed",
                              error_message="Could not find email address. Please provide one.",
-                             company_research=info["raw"])
+                             company_research=research_context)
         return
 
-    client.update_status(task_id, "running", company_research=info["raw"])
+    client.update_status(task_id, "running", company_research=research_context)
 
     # =========================================================================
     # STEP 3: Identify the best angle for this specific company (Phase 5)
@@ -123,10 +127,8 @@ Now parse the request:"""
 
 The angle should be rooted in something concrete from the research — a recent milestone, what makes this company distinctive, a challenge they're working on, or an opportunity they're chasing. Not generic flattery.
 
-Research summary:
-{info['raw']}
-
-Key facts: {recent_news}
+Research:
+{research_context}
 
 Reply with ONLY a short phrase describing the angle (e.g. "their recent expansion into healthcare", "the supply chain problem they're solving for NZ manufacturers"). No quotes, no explanation:"""
 
@@ -140,23 +142,21 @@ Reply with ONLY a short phrase describing the angle (e.g. "their recent expansio
     # =========================================================================
     log("Step 4: Drafting email...", "info")
 
-    if confidence.lower() == "low":
-        log("⚠️ Low confidence in research — email may be less specific", "info")
+    if not any(a["was_answered"] for a in info["answers"]):
+        log("⚠️ Research came back thin — email may be less specific", "info")
 
-    # Build greeting
-    greeting = "Hi"
-    if key_person and key_person.lower() not in ("not found", "none found"):
-        first_name = key_person.split()[0]
-        if first_name.lower() not in ("ceo", "founder", "manager", "director", "not", "none"):
-            greeting = f"Hi {first_name}"
+    # Build greeting — only use a name if it's clearly identified as a person
+    # (not just the first word of a "key people" answer, which is almost
+    # always the company name itself, e.g. "Acme Corp is led by Jane Smith...")
+    greeting_name = extract_greeting_name(key_person)
+    greeting = f"Hi {greeting_name}" if greeting_name else "Hi"
 
     draft_prompt = f"""Write a short, professional introduction email to {company_name}.
 
 The email should be anchored around this specific angle: {angle}
 
 Context:
-- Company: {company_name}
-- What they do: {company_summary}
+{research_context}
 - Key person: {key_person}
 - Sending to: {target_email}
 
@@ -171,10 +171,12 @@ Guidelines:
 - End with a soft call to action (open to a chat, happy to connect, etc.)
 - No "I hope this email finds you well", no hollow compliments
 - Do NOT include a greeting, signature, or subject line — those are added separately
+- Do NOT invent or guess at names, emails, phone numbers, or other contact
+  details that aren't given to you above — omit them rather than making them up
 
 Write ONLY the email body:"""
 
-    draft_body = llm_call(draft_prompt)
+    draft_body = clean_email_draft(llm_call(draft_prompt))
     log(f"Draft:\n{draft_body}", "agent")
 
     subject_prompt = f"""Write a short email subject line for an introduction to {company_name}.
@@ -184,12 +186,12 @@ The email is about: {angle}
 Under 50 characters. Be specific to this company, not generic. No emojis.
 Write ONLY the subject line:"""
 
-    subject_line = llm_call(subject_prompt).strip().strip('"')
+    subject_line = clean_subject_line(llm_call(subject_prompt))
     log(f"Subject: {subject_line}", "agent")
 
     full_email = f"""{greeting},
 
-{draft_body.strip()}
+{draft_body}
 
 Best regards,
 {SENDER_NAME}
