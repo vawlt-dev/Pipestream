@@ -47,6 +47,7 @@ def book_directly(
     duration_mins: int = 60,
     location: str = '',
     client = None,
+    description: str = '',
 ) -> bool:
     """
     Programmatic entry point — skips all parsing and confirmation.
@@ -59,6 +60,11 @@ def book_directly(
         duration_mins: Length in minutes (default 60)
         location:      Optional location string
         client:        VPSClient instance
+        description:   Optional event description — defaults to the generic
+                        "Booked via Pipestream" note if not given. Callers
+                        with richer context (e.g. email_triage.py recognizing
+                        this booking came from a known outreach campaign)
+                        should pass something more specific.
 
     Returns:
         True on success, False on failure.
@@ -78,7 +84,7 @@ def book_directly(
         summary=event_name,
         start_time=dt.isoformat(),
         end_time=dt_end.isoformat(),
-        description='Booked via Pipestream',
+        description=description or 'Booked via Pipestream',
         location=location,
     )
 

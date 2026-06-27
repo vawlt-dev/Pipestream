@@ -17,6 +17,7 @@ from core import (
 )
 from schemas import s_object, s_string, s_enum, s_array
 from tools_google import get_recent_emails, get_thread_text, send_reply
+from memory import memory_find_outreach_by_email, memory_update_outreach_status
 
 WORKFLOW_META = {
     "name": "email_triage",
@@ -164,6 +165,25 @@ List the action for each email above, in the same order."""
             skipped += 1
             continue
 
+        # Recognize whether this sender is connected to a known outreach
+        # campaign (lead_gen_outreach.py / business_intro.py) BEFORE
+        # branching on action — every branch below benefits: a reply gets
+        # drafted with knowledge of why we reached out and what we already
+        # said instead of treating the thread as cold, and a booking gets a
+        # specific calendar description instead of the generic default.
+        email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender, re.IGNORECASE)
+        reply_to    = email_match.group() if email_match else sender
+        campaign    = memory_find_outreach_by_email(reply_to)
+        campaign_context = ''
+        if campaign:
+            log(f'📌 Recognized as outreach contact: {campaign["sender"]} → {campaign["prospect"]}', 'info')
+            campaign_context = (
+                f'\nThis person was previously contacted as part of an outreach campaign '
+                f'for {campaign["sender"]}, regarding {campaign["prospect"]}. '
+                f'Angle used: {campaign["angle"]}\n'
+                f'Original message sent:\n{campaign["draft_body"][:800]}\n'
+            )
+
         # =====================================================================
         # Book appointment
         # =====================================================================
@@ -263,8 +283,14 @@ confidence: high, medium, or low"""
                 duration_mins=duration_mins,
                 location=location,
                 client=client,
+                description=(
+                    f"Outreach follow-up — {campaign['prospect']}, angle: {campaign['angle']}"
+                    if campaign else ''
+                ),
             )
             bookings_made += 1 if success else 0
+            if success and campaign:
+                memory_update_outreach_status(campaign['sender'], campaign['prospect'], 'booked')
             if not success:
                 skipped += 1
 
@@ -276,7 +302,8 @@ confidence: high, medium, or low"""
 
             draft_result = llm_structured(
                 f'Draft a reply to this email thread on behalf of {SENDER_NAME}.\n\n'
-                f'Thread:\n{thread_text}\n\n'
+                f'Thread:\n{thread_text}\n'
+                f'{campaign_context}\n'
                 f'Guidelines:\n'
                 f'- Match the tone and formality of the conversation\n'
                 f'- Be concise — answer what is being asked, nothing extra\n'
@@ -286,10 +313,7 @@ confidence: high, medium, or low"""
                 schema_name="reply_draft",
             )
             draft_body = str(draft_result.get('body') or '')
-
-            email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender, re.IGNORECASE)
-            reply_to    = email_match.group() if email_match else sender
-            full_reply  = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
+            full_reply = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
 
             answer = wait_for_input(
                 task_id,
@@ -340,6 +364,8 @@ confidence: high, medium, or low"""
 
             if '✅' in result:
                 replies_sent += 1
+                if campaign:
+                    memory_update_outreach_status(campaign['sender'], campaign['prospect'], 'replied')
             else:
                 skipped += 1
 
@@ -379,6 +405,7 @@ confidence: high, medium, or low"""
 
             # Book the event if details are complete
             booking_note = ''
+            booked_this_email = False
             if dt and event_name.lower() not in _NOT_SPECIFIED:
                 spec = importlib.util.spec_from_file_location(
                     'calendar_booking',
@@ -394,11 +421,18 @@ confidence: high, medium, or low"""
                     duration_mins=duration_mins,
                     location=location,
                     client=client,
+                    description=(
+                        f"Outreach follow-up — {campaign['prospect']}, angle: {campaign['angle']}"
+                        if campaign else ''
+                    ),
                 )
                 if success:
                     bookings_made += 1
+                    booked_this_email = True
                     booking_note = f'Calendar event "{event_name}" has been added.'
                     log(f'✅ Booked: {event_name}', 'info')
+                    if campaign:
+                        memory_update_outreach_status(campaign['sender'], campaign['prospect'], 'booked')
                 else:
                     log(f'Booking failed for "{subject}"', 'error')
             else:
@@ -411,7 +445,8 @@ confidence: high, medium, or low"""
             log(f'✍️  Drafting reply to {sender}...', 'info')
             draft_result = llm_structured(
                 f'Draft a reply to this email thread on behalf of {SENDER_NAME}.\n\n'
-                f'Thread:\n{thread_text}\n\n'
+                f'Thread:\n{thread_text}\n'
+                f'{campaign_context}\n'
                 + (f'Note: {booking_note} Mention that the meeting is confirmed.\n\n' if booking_note else '')
                 + f'Guidelines:\n'
                 f'- Match the tone and formality of the conversation\n'
@@ -422,10 +457,7 @@ confidence: high, medium, or low"""
                 schema_name="reply_draft",
             )
             draft_body = str(draft_result.get('body') or '')
-
-            email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-z]{2,}', sender, re.IGNORECASE)
-            reply_to    = email_match.group() if email_match else sender
-            full_reply  = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
+            full_reply = f"{draft_body.strip()}\n\n{SENDER_NAME}\n{SENDER_TITLE}\n{SENDER_WEBSITE}"
 
             answer = wait_for_input(
                 task_id,
@@ -476,6 +508,10 @@ confidence: high, medium, or low"""
 
             if '✅' in result:
                 replies_sent += 1
+                # Don't downgrade 'booked' back to 'replied' if the booking
+                # step above already advanced the status further THIS email.
+                if campaign and not booked_this_email:
+                    memory_update_outreach_status(campaign['sender'], campaign['prospect'], 'replied')
             else:
                 skipped += 1
 

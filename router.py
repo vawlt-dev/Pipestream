@@ -17,6 +17,7 @@ import importlib.util
 
 from core import llm_structured, wait_for_input
 from schemas import s_object, s_enum
+from tracing import set_current_task
 
 WORKFLOWS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflows")
 
@@ -114,6 +115,7 @@ def route_workflow(task_id: str, input_text: str, client, _depth: int = 0) -> No
         print(f"  [{log_type.upper()}] {msg}")
         client.log(task_id, msg, log_type)
 
+    set_current_task(task_id)
     registry = load_workflows()
     print(f"\n  [ROUTER] Loaded {len(registry)} workflow(s): {list(registry.keys())}", flush=True)
 

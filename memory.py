@@ -21,6 +21,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
+from tracing import trace
+
 WORK_DIR = os.getenv("WORK_DIR", "/workspace")
 DB_PATH  = os.path.join(WORK_DIR, "memory.db")
 
@@ -83,6 +85,28 @@ def _connect():
                 updated_at    TEXT NOT NULL,
                 expires_at    TEXT NOT NULL,
                 PRIMARY KEY (topic_key, topic_level, question_id)
+            )
+        """)
+        # A relationship between a sender and a prospect, not a fact about a
+        # topic — deliberately a separate table rather than shoehorned into
+        # the (topic_key, topic_level, question_id) schema above. Carries
+        # enough (target_email, angle, draft_body) for email_triage.py to
+        # recognize an incoming reply as connected to a specific outreach
+        # attempt and draft an informed response, not just a dedup flag.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS outreach_history (
+                sender_key   TEXT NOT NULL,
+                sender       TEXT NOT NULL,
+                prospect_key TEXT NOT NULL,
+                prospect     TEXT NOT NULL,
+                target_email TEXT NOT NULL DEFAULT '',
+                subject_line TEXT NOT NULL DEFAULT '',
+                angle        TEXT NOT NULL DEFAULT '',
+                draft_body   TEXT NOT NULL DEFAULT '',
+                status       TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY (sender_key, prospect_key)
             )
         """)
         yield conn
@@ -180,6 +204,13 @@ def memory_set_question(
             ),
         )
 
+    trace(
+        "memory_write", topic=topic, topic_key=key, topic_level=topic_level,
+        question_id=question_id, question_text=question_text, answer=answer,
+        was_answered=was_answered, confidence=confidence, volatility=volatility,
+        important=important, source_urls=source_urls or [], expires_at=expires_at,
+    )
+
 
 def memory_get_topic_questions(topic: str) -> list[dict]:
     """
@@ -212,6 +243,44 @@ def memory_get_topic_questions(topic: str) -> list[dict]:
             "source_urls": json.loads(urls_json) if urls_json else [], "updated_at": updated_at,
         })
     return results
+
+
+def memory_list_personas() -> list[str]:
+    """
+    Every distinct topic currently cached at topic_level='persona' — the
+    system's self-growing vocabulary of "kinds of things I already
+    understand". No separate table: the vocabulary *is* whatever's already
+    cached, so a freshly-learned persona is automatically part of the
+    vocabulary for every future classification call with zero extra wiring.
+    Original casing preserved (one arbitrary row's topic per distinct
+    topic_key) since this is shown to the LLM as enum choices, not used as a
+    lookup key itself.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT topic FROM memory WHERE topic_level = 'persona' ORDER BY topic"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def memory_get_persona_coverage(topic: str) -> dict:
+    """
+    Which question_ids have a fresh (non-expired) row for this persona vs.
+    are missing or stale. Powers self_study.py's gap-filling pass — doesn't
+    care whether question_ids come from SEED_QUESTIONS or PITCH_QUESTIONS,
+    it's just whatever's actually in the table for this topic_key.
+    Returns {"fresh": [question_id, ...], "stale_or_missing": [...]} — the
+    caller supplies the full universe of ids it expects to compare against.
+    """
+    key = _normalize(topic)
+    now = datetime.now(timezone.utc)
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT question_id, expires_at FROM memory WHERE topic_key = ? AND topic_level = 'persona'",
+            (key,),
+        ).fetchall()
+    fresh = [qid for qid, expires_at in rows if datetime.fromisoformat(expires_at) >= now]
+    return {"fresh": fresh}
 
 
 def memory_forget_topic(topic: str, topic_level: str) -> int:
@@ -252,3 +321,124 @@ def memory_refresh_candidates(limit: int = 20) -> list[dict]:
         }
         for (t, tl, qid, qt, imp, exp) in rows
     ]
+
+
+# =============================================================================
+# OUTREACH HISTORY — sender<->prospect relationship, not a topic fact
+# =============================================================================
+
+def memory_record_outreach(
+    sender: str,
+    prospect: str,
+    status: str,
+    target_email: str = "",
+    subject_line: str = "",
+    angle: str = "",
+    draft_body: str = "",
+) -> None:
+    """
+    Initial upsert — full record. Called from lead_gen_outreach.py/
+    business_intro.py right after a draft attempt, success or failure, so a
+    later run for the same sender knows not to retarget this prospect, and
+    email_triage.py can later recognize a reply from target_email.
+    """
+    sender_key   = _normalize(sender)
+    prospect_key = _normalize(prospect)
+    now          = datetime.now(timezone.utc).isoformat()
+
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO outreach_history (
+                sender_key, sender, prospect_key, prospect, target_email,
+                subject_line, angle, draft_body, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sender_key, prospect_key) DO UPDATE SET
+                sender       = excluded.sender,
+                prospect     = excluded.prospect,
+                target_email = excluded.target_email,
+                subject_line = excluded.subject_line,
+                angle        = excluded.angle,
+                draft_body   = excluded.draft_body,
+                status       = excluded.status,
+                updated_at   = excluded.updated_at
+            """,
+            (
+                sender_key, sender, prospect_key, prospect, target_email,
+                subject_line, angle, draft_body, status, now, now,
+            ),
+        )
+
+
+def memory_update_outreach_status(sender: str, prospect: str, status: str) -> None:
+    """
+    Lifecycle update on an EXISTING row — just status + updated_at. Used by
+    email_triage.py when a reply comes in ('replied') or a meeting gets
+    booked from that reply ('booked'). No-ops (no error) if no row exists —
+    a reply from someone never in outreach_history simply isn't a tracked
+    campaign contact.
+    """
+    sender_key   = _normalize(sender)
+    prospect_key = _normalize(prospect)
+    now          = datetime.now(timezone.utc).isoformat()
+
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE outreach_history SET status = ?, updated_at = ?
+            WHERE sender_key = ? AND prospect_key = ?
+            """,
+            (status, now, sender_key, prospect_key),
+        )
+
+
+def memory_get_contacted_prospects(sender: str) -> set[str]:
+    """
+    Normalized prospect keys already recorded for this sender, regardless of
+    status — once a prospect has been considered for a sender (drafted, or
+    tried and failed for any reason), it's excluded from future
+    lead_gen_outreach runs for that same sender.
+    """
+    sender_key = _normalize(sender)
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT prospect_key FROM outreach_history WHERE sender_key = ?",
+            (sender_key,),
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
+def memory_find_outreach_by_email(target_email: str) -> dict | None:
+    """
+    The bridge lookup email_triage.py uses: given an INCOMING email's sender
+    address, find the matching outreach record, if any. Most recent match if
+    more than one (target_email isn't part of the primary key, so this
+    shouldn't normally happen, but a person could theoretically be reached
+    twice under different prospect-name spellings).
+    """
+    if not target_email:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT sender, prospect, target_email, subject_line, angle,
+                   draft_body, status, created_at, updated_at
+            FROM outreach_history
+            WHERE target_email = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (target_email,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    (sender, prospect, email, subject_line, angle, draft_body,
+     status, created_at, updated_at) = row
+    return {
+        "sender": sender, "prospect": prospect, "target_email": email,
+        "subject_line": subject_line, "angle": angle, "draft_body": draft_body,
+        "status": status, "created_at": created_at, "updated_at": updated_at,
+    }

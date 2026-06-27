@@ -15,12 +15,13 @@ import re
 from core import (
     llm_structured, gather_info, format_answers_as_context,
     clean_email_draft, clean_subject_line, extract_greeting_name,
-    check_cancelled,
+    check_draft_appropriateness, check_cancelled, run_concurrent,
 )
 from schemas import s_object, s_string, s_int, s_array
 from research import find_contact_email
 from tools_web import web_search
 from tools_google import create_email_draft
+from memory import memory_get_contacted_prospects, memory_record_outreach, _normalize
 
 WORKFLOW_META = {
     "name": "lead_gen_outreach",
@@ -162,13 +163,15 @@ def run(task_id: str, input_text: str, client) -> None:
 
     queries = [str(q).strip() for q in (queries_result.get('queries') or []) if str(q).strip()][:4]
 
-    all_results = []
-    for q in queries:
+    def _run_discovery_search(q):
         log(f'🔍 {q}', 'tool_call')
-        result = web_search(q, max_results=8)
-        all_results.append(f'Search: {q}\n{result}')
-        if check_cancelled(task_id, client):
-            return
+        return f'Search: {q}\n{web_search(q, max_results=8)}'
+
+    search_tasks = [(lambda q=q: _run_discovery_search(q)) for q in queries]
+    all_results = run_concurrent(search_tasks)
+
+    if check_cancelled(task_id, client):
+        return
 
     combined_results = '\n\n---\n\n'.join(all_results)
 
@@ -213,6 +216,29 @@ def run(task_id: str, input_text: str, client) -> None:
 
     log(f'Found {len(unique_candidates)} unique candidates', 'tool_result')
 
+    # Exclude prospects already contacted for THIS sender in a prior run —
+    # before curation, so the buffer isn't wasted on candidates that would
+    # have been filtered out anyway. Any status counts (drafted, or tried
+    # and failed for any reason) — see memory_get_contacted_prospects().
+    already_contacted = memory_get_contacted_prospects(sender_company)
+    if already_contacted:
+        before = len(unique_candidates)
+        # memory_get_contacted_prospects() returns keys normalized via
+        # memory._normalize() (suffix/punctuation-stripped, not just
+        # lowercased) — must apply the SAME normalization here, or "Acme Ltd"
+        # vs "Acme" would never match and the dedup filter would silently do
+        # nothing for exactly the cases _normalize() exists to catch.
+        unique_candidates = [c for c in unique_candidates if _normalize(c) not in already_contacted]
+        skipped_count = before - len(unique_candidates)
+        if skipped_count:
+            log(f'Excluding {skipped_count} candidate(s) already contacted for {sender_company}', 'info')
+
+    if not unique_candidates:
+        log('All candidates already contacted for this sender — nothing new to target', 'error')
+        client.update_status(task_id, 'failed',
+                             error_message='Found candidates, but all have already been contacted for this sender.')
+        return
+
     if check_cancelled(task_id, client):
         return
 
@@ -236,31 +262,53 @@ def run(task_id: str, input_text: str, client) -> None:
     log(f'Working list: {len(curated)} companies', 'info')
 
     # =========================================================================
-    # STEP 6: Research + draft each candidate until target_count drafts exist
+    # STEP 6a: Research every candidate concurrently
     # =========================================================================
-    drafts_created:      list[str] = []
-    skipped_no_contact:   list[str] = []
-    skipped_draft_failed: list[str] = []
+    # gather_info() + find_contact_email() per candidate are fully independent
+    # of every OTHER candidate — research all of them at once instead of one
+    # at a time. Drafting + Gmail draft creation (6b below) stays sequential:
+    # Google's API client objects aren't documented thread-safe, and that's
+    # exactly the kind of real-side-effect surface not worth the risk here —
+    # the LLM-heavy research phase is where the real time is spent anyway.
+    log(f'🔬 Researching {len(curated)} candidate(s) concurrently...', 'info')
 
-    for company_name in curated:
+    def _research_candidate(company_name: str):
+        info = gather_info(
+            company_name, 'prospect', task_id, client, log,
+            context=f'Cold outreach prospect for {sender_company}. Goal: {goal}',
+            known_context_hint=own_context,
+        )
+        if not info:
+            return (company_name, None, None)  # cancelled mid-research
+        target_email = find_contact_email(company_name, task_id, client, log)
+        return (company_name, info, target_email)
+
+    research_tasks = [(lambda c=c: _research_candidate(c)) for c in curated]
+    research_results = run_concurrent(research_tasks)
+
+    if check_cancelled(task_id, client):
+        return
+
+    # =========================================================================
+    # STEP 6b: Draft + create Gmail draft, sequentially, until target_count
+    # =========================================================================
+    drafts_created:        list[str] = []
+    skipped_no_contact:     list[str] = []
+    skipped_draft_failed:   list[str] = []
+    skipped_inappropriate:  list[str] = []
+
+    for company_name, info, target_email in research_results:
         if len(drafts_created) >= target_count:
             break
         if check_cancelled(task_id, client):
             return
-
-        log(f'─── Researching: {company_name}', 'info')
-        info = gather_info(
-            company_name, 'prospect', task_id, client, log,
-            context=f'Cold outreach prospect for {sender_company}. Goal: {goal}',
-        )
         if not info:
-            return  # cancelled mid-research
-
-        target_email = find_contact_email(company_name, task_id, client, log)
+            continue  # cancelled mid-research for this one specifically
 
         if not target_email:
             log(f'No contact email found for {company_name} — skipping', 'info')
             skipped_no_contact.append(company_name)
+            memory_record_outreach(sender_company, company_name, 'skipped_no_contact')
             continue
 
         research_context = format_answers_as_context(info)
@@ -294,30 +342,55 @@ def run(task_id: str, input_text: str, client) -> None:
         greeting = f'Hi {greeting_name}' if greeting_name else 'Hi'
 
         # --- Draft body ---
-        draft_result = llm_structured(
-            f'Write a short, professional cold outreach email to {company_name}.\n\n'
-            f'The email should be anchored around this angle: {angle}\n\n'
-            f'Context:\n'
-            f'- Target company: {company_name}\n{research_context}\n'
-            f'- Outreach goal: {goal}\n\n'
-            f'About the sender:\n'
-            f'- Name: {sender_name}\n'
-            f'- Title: {sender_title} at {sender_company}\n'
-            f'- What {sender_company} does: {own_context}\n\n'
-            f'Guidelines:\n'
-            f'- 3-5 sentences max\n'
-            f'- Open by acknowledging the angle naturally\n'
-            f'- Be warm and direct, not corporate\n'
-            f'- End with a soft call to action\n'
-            f'- Do NOT include a greeting, signature, or subject line\n'
-            f'- Do NOT invent or guess at names, emails, phone numbers, or other '
-            f'contact details that aren\'t given to you above — omit them rather '
-            f'than making them up\n\n'
-            f'body: the email body only',
-            _DRAFT_BODY_SCHEMA,
-            schema_name="email_draft_body",
-        )
-        draft_body = clean_email_draft(str(draft_result.get('body') or ''))
+        def _generate_draft_body(extra_feedback: str = '') -> str:
+            feedback_line = (
+                f'\nPREVIOUS ATTEMPT HAD THIS PROBLEM — avoid it this time: {extra_feedback}\n'
+                if extra_feedback else ''
+            )
+            draft_result = llm_structured(
+                f'Write a short, professional cold outreach email to {company_name}.\n\n'
+                f'The email should be anchored around this angle: {angle}\n\n'
+                f'Context:\n'
+                f'- Target company: {company_name}\n{research_context}\n'
+                f'- Outreach goal: {goal}\n\n'
+                f'About the sender:\n'
+                f'- Name: {sender_name}\n'
+                f'- Title: {sender_title} at {sender_company}\n'
+                f'- What {sender_company} does: {own_context}\n\n'
+                f'{feedback_line}'
+                f'Guidelines:\n'
+                f'- 3-5 sentences max\n'
+                f'- Open by acknowledging the angle naturally\n'
+                f'- Be warm and direct, not corporate\n'
+                f'- End with a soft call to action\n'
+                f'- Do NOT include a greeting, signature, or subject line\n'
+                f'- Do NOT invent or guess at names, emails, phone numbers, or other '
+                f'contact details that aren\'t given to you above — omit them rather '
+                f'than making them up\n\n'
+                f'body: the email body only',
+                _DRAFT_BODY_SCHEMA,
+                schema_name="email_draft_body",
+            )
+            return clean_email_draft(str(draft_result.get('body') or ''))
+
+        draft_body = _generate_draft_body()
+
+        # Content-safety gate, separate from the no-fabrication instruction
+        # above — that guards against invented CONTACT DETAILS, this guards
+        # against presumptuous/offensive CLAIMS (the real example that
+        # motivated this: a draft asserting something like "your workers are
+        # suffering from mental health issues" as a pitch angle). One retry
+        # with the concern fed back as corrective feedback, then skip.
+        safety = check_draft_appropriateness(draft_body, company_name)
+        if not safety['appropriate']:
+            log(f"⚠️ Draft flagged: {safety['concern']} — regenerating once", 'info')
+            draft_body = _generate_draft_body(extra_feedback=safety['concern'])
+            safety = check_draft_appropriateness(draft_body, company_name)
+            if not safety['appropriate']:
+                log(f"✗ Still flagged after retry: {safety['concern']} — skipping", 'error')
+                skipped_inappropriate.append(company_name)
+                memory_record_outreach(sender_company, company_name, 'skipped_inappropriate')
+                continue
 
         subject_result = llm_structured(
             f'Write a short email subject line (under 50 characters) for outreach to '
@@ -342,9 +415,15 @@ def run(task_id: str, input_text: str, client) -> None:
         log(result, 'tool_result' if '✅' in result else 'error')
 
         if '✅' in result:
+            memory_record_outreach(
+                sender_company, company_name, 'drafted',
+                target_email=target_email, subject_line=subject_line,
+                angle=angle, draft_body=full_email,
+            )
             drafts_created.append(company_name)
         else:
             skipped_draft_failed.append(company_name)
+            memory_record_outreach(sender_company, company_name, 'skipped_draft_failed')
 
         if check_cancelled(task_id, client):
             return
@@ -359,6 +438,8 @@ def run(task_id: str, input_text: str, client) -> None:
         summary += f' Skipped {len(skipped_no_contact)} (no contact found): {", ".join(skipped_no_contact)}.'
     if skipped_draft_failed:
         summary += f' Skipped {len(skipped_draft_failed)} (found contact but draft creation failed): {", ".join(skipped_draft_failed)}.'
+    if skipped_inappropriate:
+        summary += f' Skipped {len(skipped_inappropriate)} (flagged content concern): {", ".join(skipped_inappropriate)}.'
 
     log(f'✅ {summary}', 'success')
     client.update_status(task_id, 'completed', result=summary)

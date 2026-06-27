@@ -17,9 +17,12 @@ COPY core.py .
 COPY memory.py .
 COPY research.py .
 COPY schemas.py .
+COPY tracing.py .
 COPY tools_web.py .
 COPY tools_google.py .
 COPY workflows/ ./workflows/
+COPY tests/ ./tests/
+COPY pytest.ini .
 
 # Create workspace directory
 RUN mkdir -p /workspace

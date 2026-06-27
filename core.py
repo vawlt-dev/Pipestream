@@ -9,10 +9,19 @@ import os
 import re
 import json
 import time
+import threading
+import contextvars
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, TypeVar
 
 import jsonschema
 from langchain_openai import ChatOpenAI
+
+from tracing import trace
+from schemas import s_object, s_bool, s_string
+
+T = TypeVar("T")
 
 # Sender identity — set in .env
 SENDER_NAME    = os.getenv("SENDER_NAME", "")
@@ -61,6 +70,65 @@ _llm = ChatOpenAI(**_BASE_KWARGS, temperature=0.7)
 # response_format (see llm_structured below)
 _llm_structured = ChatOpenAI(**_BASE_KWARGS, temperature=0.1, max_tokens=768)
 
+# =============================================================================
+# CONCURRENCY
+# =============================================================================
+# Two decoupled limits, not one:
+#   - MAX_PARALLEL_LLM_CALLS / _llm_slot: how many calls can actually be
+#     inside LM Studio at once. Set this to match LM Studio's own "Num
+#     Parallel Slots" server setting (visible/changeable there) — raising it
+#     past whatever LM Studio is really configured for doesn't break
+#     anything, it just queues client-side with no benefit (watch the traced
+#     wait_s field: consistently high means turn this UP to match LM Studio;
+#     consistently near-zero means you're already at the ceiling).
+#   - run_concurrent()'s pool: how many independent CHAINS (e.g. one
+#     question's full search→scrape→reflect→extract pipeline) can be running
+#     at once. Deliberately NOT capped at the same "4" — a chain spends most
+#     of its wall-clock time on non-LLM I/O (search, scrape), so capping the
+#     chain pool at the LLM slot count would leave slots idle whenever a
+#     chain is mid-scrape while other chains queue behind it for no reason.
+#     The semaphore below is what actually prevents oversaturating LM Studio,
+#     regardless of how many chains/threads are running or nested.
+MAX_PARALLEL_LLM_CALLS = int(os.getenv("MAX_PARALLEL_LLM_CALLS", "4"))
+_llm_slot = threading.Semaphore(MAX_PARALLEL_LLM_CALLS)
+
+
+def run_concurrent(tasks: list[Callable[[], T]], max_workers: int = 16) -> list[T]:
+    """
+    Run independent zero-arg callables concurrently. NOT capped at
+    MAX_PARALLEL_LLM_CALLS — see the CONCURRENCY note above for why. Safe to
+    nest: a task submitted here may itself call run_concurrent() again for
+    its own independent sub-work, since the global _llm_slot semaphore (not
+    this pool's size) is what bounds real LM Studio concurrency.
+
+    Returns results in the SAME ORDER as the input list, regardless of
+    completion order, so callers can zip results back against whatever they
+    were generated from. Exceptions from any one task propagate naturally.
+
+    Propagates the calling thread's contextvars (notably tracing.py's
+    current-task context) into each worker via contextvars.copy_context() —
+    without this, trace() calls made from inside a parallelized task would
+    fall back to a fresh random task name per thread instead of resolving to
+    the real task_id already set by router.set_current_task(). A FRESH
+    snapshot is taken per task (not one shared Context reused across
+    submissions) — a single contextvars.Context object cannot be entered
+    concurrently by more than one thread at a time, only sequentially;
+    sharing one across simultaneously-running futures raises "cannot enter
+    context: ... is already entered".
+    """
+    if len(tasks) <= 1:
+        return [t() for t in tasks]
+
+    results: list = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=min(len(tasks), max_workers)) as executor:
+        future_to_index = {
+            executor.submit(contextvars.copy_context().run, fn): i
+            for i, fn in enumerate(tasks)
+        }
+        for future in as_completed(future_to_index):
+            results[future_to_index[future]] = future.result()
+    return results
+
 
 def llm_call(prompt: str) -> str:
     """
@@ -101,14 +169,27 @@ def llm_structured(prompt: str, schema: dict, schema_name: str = "response") -> 
         "json_schema": {"name": schema_name, "strict": True, "schema": schema},
     }
     dbg_block(f"LLM STRUCTURED PROMPT  ({len(prompt)} chars)", prompt)
-    t0       = time.time()
-    response = _llm_structured.invoke(prompt, response_format=response_format).content
-    elapsed  = time.time() - t0
-    dbg_block(f"LLM STRUCTURED RESPONSE  ({len(response)} chars, {elapsed:.1f}s)", response)
+    t0 = time.time()
+    with _llm_slot:
+        t1      = time.time()  # wait_s = t1 - t0: time spent queued behind MAX_PARALLEL_LLM_CALLS
+        response = _llm_structured.invoke(prompt, response_format=response_format).content
+    elapsed  = time.time() - t1
+    wait_s   = t1 - t0
+    dbg_block(f"LLM STRUCTURED RESPONSE  ({len(response)} chars, {elapsed:.1f}s, waited {wait_s:.1f}s)", response)
+
     try:
-        return json.loads(response)
+        parsed = json.loads(response)
+        trace(
+            "llm_call", schema_name=schema_name, prompt=prompt, schema=schema,
+            response=response, parsed=parsed, elapsed_s=round(elapsed, 2), wait_s=round(wait_s, 2),
+        )
+        return parsed
     except Exception:
         dbg(f"llm_structured: failed to parse JSON response")
+        trace(
+            "llm_call_parse_failed", schema_name=schema_name, prompt=prompt,
+            schema=schema, response=response, elapsed_s=round(elapsed, 2), wait_s=round(wait_s, 2),
+        )
         return {}
 
 
@@ -141,6 +222,17 @@ def parse_duration(duration_str: str) -> int:
     return total if total > 0 else 60
 
 
+# Serializes the actually-asking path below across threads — run_concurrent()
+# means multiple independent chains (e.g. several candidates in
+# lead_gen_outreach.py) could each hit an ambiguous entity and call
+# wait_for_input() at the same moment; without this lock, two concurrent
+# calls would race on the same task's pending_question/user_input fields via
+# client.update_status(), and a reply meant for one question could get read
+# as the answer to the other. The trusted fast-path below never touches that
+# shared state, so it isn't covered by the lock.
+_wait_for_input_lock = threading.Lock()
+
+
 def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> str | None:
     """
     Post a question to the user and block until they reply.
@@ -154,6 +246,11 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
         client.log(task_id, "✅ Proceeding autonomously", "success")
         return "yes"
 
+    with _wait_for_input_lock:
+        return _wait_for_input_locked(task_id, question, client, timeout)
+
+
+def _wait_for_input_locked(task_id: str, question: str, client, timeout: int) -> str | None:
     dbg(f"wait_for_input: posting question ({len(question)} chars), timeout={timeout}s")
     client.update_status(task_id, "awaiting_input", pending_question=question, user_input="")
     client.log(task_id, f"💬 {question}", "info")
@@ -193,6 +290,80 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
     return None
 
 
+_DISAMBIGUATION_QID = "DISAMBIGUATION"
+
+
+def disambiguate_if_needed(
+    topic: str, context: str, known_context_hint: str, task_id: str, client, log,
+) -> str:
+    """
+    Returns a possibly-refined topic (e.g. "McDonald's Hastings (New Zealand)")
+    for all subsequent research/caching under this call — the disambiguated
+    name becomes the cache key too, so a generic "McDonald's Hastings" entry
+    never gets contaminated with mixed-country facts. Returns the original
+    topic unchanged if no ambiguity is detected.
+
+    The resolution itself is cached — reuses the exact same memory plumbing
+    as everything else in this system (memory_get_question/memory_set_question,
+    topic_level="prospect", a dedicated question_id) rather than a new table.
+    Without this, every task that happens to mention "ABC Accounts" would
+    re-run a search + LLM judgment call from scratch, even seconds after a
+    DIFFERENT task already resolved the exact same name. Checked before any
+    search/LLM work happens — a cache hit here is free, no network calls at
+    all. Cached at GLACIAL volatility: which real entity a name refers to is
+    about as stable a fact as this system tracks.
+
+    wait_for_input() already auto-returns "yes" for trusted/autonomous tasks
+    (see its own trusted-task fast path above) — correct for a yes/no
+    confirmation, meaningless as an actual disambiguating answer. So this
+    function checks the task's trusted flag itself: if trusted, auto-picks
+    the best-guess candidate (informed by known_context_hint) and logs the
+    decision clearly rather than asking and folding a useless "yes" into the
+    topic. If not trusted, actually asks via wait_for_input() and folds the
+    real answer in.
+    """
+    from research import check_ambiguity, build_disambiguation_question, pick_best_guess_candidate
+    from memory import memory_get_question, memory_set_question
+
+    cached = memory_get_question(topic, "prospect", _DISAMBIGUATION_QID)
+    if cached and cached.get("was_answered"):
+        log(f"📚 cached disambiguation: '{topic}' → {cached['answer']}", "info")
+        return cached["answer"]
+
+    decision = check_ambiguity(topic, context, known_context_hint)
+    candidates = decision.get("candidates") or []
+    # Gate on candidate COUNT, not just the "ambiguous" boolean — confirmed
+    # via live testing that this model sometimes populates 2+ genuinely
+    # distinct candidates while still setting ambiguous=false, the same
+    # class of small-model field inconsistency this codebase already
+    # defends against elsewhere (see resolve_persona, _is_generalizable).
+    # Trusting candidate count is the more robust signal of the two.
+    if len(candidates) < 2:
+        return topic
+
+    task = client.get_task(task_id)
+    if task and task.get("trusted"):
+        best_guess = pick_best_guess_candidate(topic, candidates, known_context_hint)
+        if not best_guess:
+            return topic
+        resolved = f"{topic} ({best_guess})"
+        log(f"🤖 (trusted) Ambiguous '{topic}' — auto-picked: {best_guess}", "info")
+    else:
+        question = build_disambiguation_question(topic, candidates, known_context_hint)
+        log(f"❓ Ambiguous entity — asking for clarification: {question}", "info")
+        answer = wait_for_input(task_id, question, client)
+        if not answer:
+            return topic
+        resolved = f"{topic} ({answer.strip()})"
+
+    memory_set_question(
+        topic, "prospect", _DISAMBIGUATION_QID,
+        f"Which real-world entity does '{topic}' refer to?",
+        answer=resolved, confidence="high", volatility="GLACIAL",
+    )
+    return resolved
+
+
 # =============================================================================
 # INFORMATION GATHERING
 # =============================================================================
@@ -206,16 +377,47 @@ def wait_for_input(task_id: str, question: str, client, timeout: int = 300) -> s
 def format_answers_as_context(result: dict) -> str:
     """
     Join a gather_info() result's per-question answers into a readable block
-    for embedding in downstream drafting prompts.
+    for embedding in downstream drafting prompts. When the result carries a
+    persona/pitch_logic cascade (see gather_info()'s docstring), renders
+    pitch-logic first, then generic persona facts, then prospect-specific
+    facts — drafting prompts see cached strategic scaffolding before the raw
+    facts, rather than only ever seeing the company-specific layer the way
+    they did before the cascade existed.
     """
-    if not result or not result.get("answers"):
+    if not result:
         return "No research available."
-    return "\n\n".join(
-        f"{a['question_text']}\n{a['answer']}" for a in result["answers"]
-    )
+
+    sections = []
+
+    pitch_logic = result.get("pitch_logic")
+    if pitch_logic and pitch_logic.get("answers"):
+        pitch_text = "\n\n".join(
+            f"{a['question_text']}\n{a['answer']}" for a in pitch_logic["answers"] if a.get("was_answered")
+        )
+        if pitch_text:
+            sections.append(f"How to pitch this kind of organization:\n{pitch_text}")
+
+    persona = result.get("persona")
+    if persona and persona.get("answers"):
+        persona_text = "\n\n".join(
+            f"{a['question_text']}\n{a['answer']}" for a in persona["answers"] if a.get("was_answered")
+        )
+        if persona_text:
+            category = result.get("category") or persona.get("topic") or "this category"
+            sections.append(f"General knowledge about {category}-type organizations:\n{persona_text}")
+
+    if result.get("answers"):
+        prospect_text = "\n\n".join(f"{a['question_text']}\n{a['answer']}" for a in result["answers"])
+        if prospect_text:
+            sections.append(prospect_text)
+
+    return "\n\n---\n\n".join(sections) if sections else "No research available."
 
 
-def gather_info(topic: str, topic_level: str, task_id: str, client, log, context: str = "") -> dict:
+def gather_info(
+    topic: str, topic_level: str, task_id: str, client, log,
+    context: str = "", known_context_hint: str = "",
+) -> dict:
     """
     Generic information gathering via the 15-question seed framework.
 
@@ -227,33 +429,138 @@ def gather_info(topic: str, topic_level: str, task_id: str, client, log, context
                   get the wrong query/extraction behavior by omitting it.
     context     — why we're researching this. Drives question selection and
                   the deep-dive gate; not cached, since it varies per call.
+    known_context_hint — optional prior research the CALLER already has that
+                  might help disambiguate an ambiguous name (e.g. the
+                  sender's own already-researched company info in
+                  lead_gen_outreach.py). Kept domain-agnostic here — this
+                  function doesn't need to know what a "sender" is, just
+                  passes whatever string it's given into the disambiguation
+                  question/auto-pick. Only used for topic_level="prospect".
+
+    For topic_level="prospect" calls, disambiguate_if_needed() runs FIRST —
+    a name like "McDonald's Hastings" can refer to more than one real
+    business, and proceeding under the wrong one poisons the cache, not just
+    one draft. Then Q1 is always answered first (forced, not left to
+    select_seed_questions' discretion) and its answer is used to resolve a
+    persona/category via research.resolve_persona() — grounded in real
+    research, not the entity's bare name, since an opaque name like "RJ and
+    Decker" gives no lexical hint about what it is the way "Bob's Accounts"
+    would. Once resolved, this function cascades internally — a
+    "persona"-level gather_info() call for that category plus a separate
+    gather_pitch_logic() call — staged AFTER the remaining 2
+    prospect-specific questions, not fired alongside them, since the persona
+    call and gather_pitch_logic() each spawn their own internal concurrent
+    batch; running all three groups at once would multiply simultaneous
+    demand on the LLM backend rather than just speed things up (confirmed
+    costly on memory-constrained local inference hardware, not just a
+    semaphore-bound concern). Generic category knowledge and pitch guidance
+    get populated (or reused from cache) automatically. Only cascades one level
+    deep: the recursive persona-level call always hits the topic_level ==
+    "persona" branch below, which does flat research with no further
+    cascade.
 
     Returns:
-        {"topic": ..., "topic_level": ...,
-         "answers": [{"question_id", "question_text", "answer",
-                       "confidence", "volatility"}, ...]}
+        {"topic", "topic_level", "answers": [...],
+         "category": str | None, "persona": dict | None, "pitch_logic": dict | None}
     Returns empty dict if the task is cancelled mid-run.
     """
     if topic_level not in ("persona", "prospect"):
         raise ValueError(f'topic_level must be "persona" or "prospect", got {topic_level!r}')
 
-    from research import SEED_QUESTIONS, select_seed_questions, answer_question, should_deep_dive, branch_research
+    from research import (
+        SEED_QUESTIONS, select_seed_questions, answer_question, should_deep_dive,
+        branch_research, resolve_persona, gather_pitch_logic,
+    )
 
-    log(f"🧭 Selecting research questions for '{topic}' ({topic_level})", "info")
-    question_ids = select_seed_questions(topic, topic_level, context)
-    log(f"Selected: {', '.join(question_ids)}", "agent")
+    category      = None
+    persona_block = None
+    pitch_block   = None
+    answers       = []
 
-    answers = []
-    for qid in question_ids:
+    if topic_level == "prospect":
+        topic = disambiguate_if_needed(topic, context, known_context_hint, task_id, client, log)
         if check_cancelled(task_id, client):
             return {}
-        question_text = SEED_QUESTIONS.get(qid, qid).replace("{X}", topic)
-        row = answer_question(topic, topic_level, qid, question_text, context, task_id, client, log)
-        if row:
-            answers.append(row)
 
-    if check_cancelled(task_id, client):
-        return {}
+        log(f"🧭 Researching '{topic}' (prospect) — Q1 first for classification", "info")
+        q1_text = SEED_QUESTIONS["Q1"].replace("{X}", topic)
+        q1_row  = answer_question(topic, "prospect", "Q1", q1_text, context, task_id, client, log)
+        if not q1_row:
+            return {}
+        answers.append(q1_row)
+
+        if check_cancelled(task_id, client):
+            return {}
+
+        category = resolve_persona(topic, q1_row.get("answer", ""), task_id, client, log)
+        remaining_ids = [qid for qid in select_seed_questions(topic, topic_level, context) if qid != "Q1"][:2]
+        log(f"Selected: {', '.join(remaining_ids)}", "agent")
+
+        if check_cancelled(task_id, client):
+            return {}
+
+        # These three groups are mutually independent in DATA terms, but NOT
+        # in DEMAND terms — gather_info(category, "persona", ...) and
+        # gather_pitch_logic() each spawn their OWN internal 3-wide
+        # concurrent batch. Firing all three groups in one outer
+        # run_concurrent() call (as an earlier version of this function did)
+        # meant up to ~8 leaf chains (2 + 3 + 3) all competing for the real
+        # LLM backend AT THE SAME INSTANT — confirmed by a live failure this
+        # session (a 992s task that ended in "Context size has been
+        # exceeded", with individual calls measuring 190-251s of pure
+        # semaphore queue time). The global semaphore in llm_structured()
+        # bounds how many calls can be MID-FLIGHT, but does nothing about
+        # how many get QUEUED at once, and on memory-constrained local
+        # inference hardware (KV-cache / context budget shared across
+        # llama.cpp's parallel slots), piling up demand is its own problem
+        # independent of the semaphore.
+        #
+        # Fix: stage these three groups sequentially. Each group still runs
+        # internally concurrent (the cheap win — 2 or 3 leaf chains at once
+        # within ONE group), but the groups themselves don't overlap, so
+        # peak simultaneous demand is bounded by the WIDEST single group
+        # (3), not the sum of all three (8).
+        question_tasks = [
+            (lambda qid=qid, qt=SEED_QUESTIONS.get(qid, qid).replace("{X}", topic): answer_question(
+                topic, topic_level, qid, qt, context, task_id, client, log,
+            ))
+            for qid in remaining_ids
+        ]
+        for result in run_concurrent(question_tasks):
+            if result:
+                answers.append(result)
+
+        if check_cancelled(task_id, client):
+            return {}
+
+        if category and category != "uncategorized":
+            persona_block = gather_info(
+                category, "persona", task_id, client, log,
+                context=f"Generic knowledge about {category}-type organizations",
+            )
+            if check_cancelled(task_id, client):
+                return {}
+            pitch_block = gather_pitch_logic(category, task_id, client, log)
+            if check_cancelled(task_id, client):
+                return {}
+    else:
+        log(f"🧭 Selecting research questions for '{topic}' ({topic_level})", "info")
+        remaining_ids = select_seed_questions(topic, topic_level, context)
+        log(f"Selected: {', '.join(remaining_ids)}", "agent")
+
+        question_tasks = [
+            (lambda qid=qid: answer_question(
+                topic, topic_level, qid, SEED_QUESTIONS.get(qid, qid).replace("{X}", topic),
+                context, task_id, client, log,
+            ))
+            for qid in remaining_ids
+        ]
+        for row in run_concurrent(question_tasks):
+            if row:
+                answers.append(row)
+
+        if check_cancelled(task_id, client):
+            return {}
 
     fires, _justification = should_deep_dive(topic, context, task_id, client, log)
     if fires and answers:
@@ -267,7 +574,10 @@ def gather_info(topic: str, topic_level: str, task_id: str, client, log, context
             merged[row["question_id"]] = row
         answers = list(merged.values())
 
-    return {"topic": topic, "topic_level": topic_level, "answers": answers}
+    return {
+        "topic": topic, "topic_level": topic_level, "answers": answers,
+        "category": category, "persona": persona_block, "pitch_logic": pitch_block,
+    }
 
 
 # =============================================================================
@@ -344,6 +654,47 @@ def clean_email_draft(body: str) -> str:
         text = text[:signoff_match.start()]
 
     return text.strip()
+
+
+_DRAFT_SAFETY_SCHEMA = s_object({"appropriate": s_bool(), "concern": s_string()})
+
+
+def check_draft_appropriateness(draft_body: str, company_name: str) -> dict:
+    """
+    Content-safety gate, distinct from clean_email_draft()'s formatting
+    hygiene above and from research._is_generalizable()'s genericness check
+    — neither of those catches a draft asserting something presumptuous or
+    offensive about real people (the concrete case that motivated this:
+    a draft asserting something like "your workers are suffering from
+    mental health issues" as a pitch angle). Drafts already require human
+    approval before sending — this is a second layer that stops the worst
+    material from ever reaching that review stage, not a replacement for it.
+
+    Returns {"appropriate": bool, "concern": str} — concern is empty when
+    appropriate is true.
+    """
+    prompt = (
+        f'Review this cold outreach email draft to "{company_name}":\n\n'
+        f'{draft_body}\n\n'
+        f'Does it make any presumptuous, sensitive, or unverifiable claims '
+        f'about the recipient or their people — e.g. speculating about '
+        f'employees\' mental health, financial struggles, personal life, or '
+        f'other sensitive topics not actually confirmed by research? Is the '
+        f'tone professional and respectful throughout? Set appropriate to '
+        f'false and describe the concern in one sentence if either check fails.'
+    )
+    result = llm_structured(prompt, _DRAFT_SAFETY_SCHEMA, schema_name="draft_appropriateness")
+    # Fail CLOSED, not open — llm_structured() returns {} on a parse failure,
+    # and a missing safety verdict must never be silently treated as "safe to
+    # send". Worst case this forces an unnecessary retry; the opposite
+    # default risks shipping exactly the kind of draft this gate exists to
+    # catch.
+    if not result:
+        return {"appropriate": False, "concern": "Safety check failed to return a usable verdict — treating as unsafe."}
+    return {
+        "appropriate": bool(result.get("appropriate", False)),
+        "concern": str(result.get("concern") or "").strip(),
+    }
 
 
 def clean_subject_line(subject: str) -> str:

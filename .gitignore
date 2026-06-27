@@ -8,6 +8,12 @@ workspace/credentials.json
 # Database — contains API key hashes and task history
 *.db
 
+# Runtime trace output (tracing.py, TRACE_ENABLED=1) — debug artifacts, not source
+workspace/traces/
+
+# Stale scratch HTML dumps from ad-hoc scrape_url() testing — not source
+raw_*.html
+
 # Python
 __pycache__/
 *.pyc

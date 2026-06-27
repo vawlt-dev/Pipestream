@@ -25,10 +25,13 @@ services:
       - ./memory.py:/app/memory.py
       - ./research.py:/app/research.py
       - ./schemas.py:/app/schemas.py
+      - ./tracing.py:/app/tracing.py
       - ./router.py:/app/router.py
       - ./tools_google.py:/app/tools_google.py
       - ./tools_web.py:/app/tools_web.py
       - ./agent_worker.py:/app/agent_worker.py
+      - ./tests:/app/tests
+      - ./pytest.ini:/app/pytest.ini
     
     # Allow connecting to LM Studio on host
     extra_hosts:

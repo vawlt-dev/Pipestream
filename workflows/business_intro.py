@@ -11,12 +11,13 @@
 from core import (
     llm_structured, gather_info, format_answers_as_context,
     clean_email_draft, clean_subject_line, extract_greeting_name,
-    wait_for_input, check_cancelled,
+    check_draft_appropriateness, wait_for_input, check_cancelled,
     SENDER_NAME, SENDER_TITLE, SENDER_WEBSITE, SENDER_BIO,
 )
 from schemas import s_object, s_string
 from research import find_contact_email
 from tools_google import send_email
+from memory import memory_record_outreach
 
 _PARSED_REQUEST_SCHEMA = s_object({"company": s_string(), "email": s_string()})
 _ANGLE_SCHEMA          = s_object({"angle": s_string()})
@@ -171,6 +172,28 @@ body: the email body only"""
     draft_body = clean_email_draft(str(draft_result.get("body") or ""))
     log(f"Draft:\n{draft_body}", "agent")
 
+    # Content-safety gate, separate from the no-fabrication instruction above
+    # — that guards against invented contact details, this guards against
+    # presumptuous/offensive claims. This workflow auto-SENDS after human
+    # confirmation (not just drafts, like lead_gen_outreach.py), so catching
+    # this before the confirmation step matters even more here.
+    safety = check_draft_appropriateness(draft_body, company_name)
+    if not safety["appropriate"]:
+        log(f"⚠️ Draft flagged: {safety['concern']} — regenerating once", "info")
+        draft_result = llm_structured(
+            draft_prompt + f"\n\nPREVIOUS ATTEMPT HAD THIS PROBLEM — avoid it this time: {safety['concern']}",
+            _DRAFT_BODY_SCHEMA, schema_name="email_draft_body_retry",
+        )
+        draft_body = clean_email_draft(str(draft_result.get("body") or ""))
+        safety = check_draft_appropriateness(draft_body, company_name)
+        if not safety["appropriate"]:
+            log(f"✗ Still flagged after retry: {safety['concern']} — aborting", "error")
+            client.update_status(
+                task_id, "failed",
+                error_message=f"Draft repeatedly flagged for review: {safety['concern']}",
+            )
+            return
+
     subject_prompt = f"""Write a short email subject line for an introduction to {company_name}.
 
 The email is about: {angle}
@@ -248,6 +271,17 @@ Best regards,
 
         if "✅" in result:
             log("🎉 Email sent successfully!", "success")
+            # SENDER_NAME is this workflow's only sender identity (no
+            # per-request sender company the way lead_gen_outreach.py has) —
+            # known limitation: the two workflows only share dedup/reply
+            # history for the same real-world sender if these identity
+            # strings happen to match, since there's no unified
+            # signed-in-user identity yet.
+            memory_record_outreach(
+                SENDER_NAME, company_name, "drafted",
+                target_email=target_email, subject_line=subject_line,
+                angle=angle, draft_body=full_email,
+            )
             client.update_status(task_id, "completed", result=f"Email sent to {target_email}")
         else:
             log(f"Email sending issue: {result}", "error")
