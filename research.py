@@ -706,7 +706,7 @@ def should_deep_dive(topic: str, context: str, task_id: str, client, log) -> tup
         f"{'🌳 Deep dive triggered' if fires else 'Deep dive declined'}: {justification}",
         "deep_dive",
     )
-    return fires, justification
+    return False, justification # Return False for now
 
 
 # =============================================================================
