@@ -14,6 +14,14 @@ workspace/traces/
 # Stale scratch HTML dumps from ad-hoc scrape_url() testing — not source
 raw_*.html
 
+# One-off documents that don't belong in the repo
+*.md
+!README.md
+!workflows_guidelines.md
+
+# Runtime live-state file (cross-process semaphore coordination, not source)
+workspace/live_state.json
+
 # Python
 __pycache__/
 *.pyc
