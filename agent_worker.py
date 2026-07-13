@@ -18,6 +18,7 @@ import time
 import requests
 from datetime import datetime
 from router import route_workflow
+from local_logs import log_local
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -90,6 +91,7 @@ class VPSClient:
     
     def log(self, task_id: str, message: str, log_type: str = "info"):
         """Add a log entry visible in the web UI."""
+        log_local(task_id, message, log_type)
         try:
             r = requests.post(
                 f"{self.base_url}/agent/api/task/{task_id}/log",

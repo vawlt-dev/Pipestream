@@ -1,0 +1,15 @@
+# Pipestream Debug GUI — native desktop app, runs on the host (Windows),
+# never inside the Docker image. Kept as its own requirements file rather
+# than merging into the project root's requirements.txt, since these two
+# dependencies have nothing to do with the agent worker itself.
+#
+# NOTE: the GUI's Test Runner panel imports real agentt modules directly
+# (core.py, memory.py, research.py, invoke.py) to actually invoke functions
+# and workflows — so the same Python environment also needs everything in
+# ../requirements.txt installed (langchain-openai, jsonschema, filelock,
+# etc.), not just the two listed here. Easiest: reuse the project's own
+# .venv rather than creating a separate one — `pip install -r
+# debug_gui/requirements.txt` on top of an environment that already has
+# ../requirements.txt installed.
+PySide6>=6.7.0
+watchdog>=4.0.0

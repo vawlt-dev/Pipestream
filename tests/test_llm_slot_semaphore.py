@@ -45,10 +45,15 @@ _SCHEMA = {
 }
 
 
-def test_semaphore_caps_real_concurrency(monkeypatch):
+def test_semaphore_caps_real_concurrency(monkeypatch, tmp_path):
     fake = _ConcurrencyTrackingFakeLLM(sleep_s=0.1)
     monkeypatch.setattr(core, "_llm_structured", fake)
-    monkeypatch.setattr(core, "_llm_slot", threading.Semaphore(4))
+    # A real ChainRegistry against a throwaway state file, not a plain
+    # threading.Semaphore — core.llm_structured() now calls
+    # register_chain()/acquire_for()/release_for()/unregister_chain() on
+    # _llm_slot, not just `with _llm_slot:`, so the stand-in needs the same
+    # cross-process-capable interface, just pointed at an isolated file.
+    monkeypatch.setattr(core, "_llm_slot", core.ChainRegistry(4, str(tmp_path / "live_state.json")))
 
     tasks = [
         (lambda: core.llm_structured("test prompt", _SCHEMA, schema_name="test"))
@@ -62,14 +67,14 @@ def test_semaphore_caps_real_concurrency(monkeypatch):
     assert fake.max_in_flight > 1, "test is too weak to prove anything — no real concurrency was observed"
 
 
-def test_semaphore_of_one_fully_serializes(monkeypatch):
+def test_semaphore_of_one_fully_serializes(monkeypatch, tmp_path):
     # monkeypatch (not manual try/finally) so BOTH patches are guaranteed to
     # revert after this test — a prior version of this test patched
     # core._llm_structured directly without restoring it, which leaked the
     # fake into every later test in the same pytest session.
     fake = _ConcurrencyTrackingFakeLLM(sleep_s=0.05)
     monkeypatch.setattr(core, "_llm_structured", fake)
-    monkeypatch.setattr(core, "_llm_slot", threading.Semaphore(1))
+    monkeypatch.setattr(core, "_llm_slot", core.ChainRegistry(1, str(tmp_path / "live_state.json")))
 
     tasks = [
         (lambda: core.llm_structured("test prompt", _SCHEMA, schema_name="test"))

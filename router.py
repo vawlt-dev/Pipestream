@@ -17,7 +17,7 @@ import importlib.util
 
 from core import llm_structured, wait_for_input
 from schemas import s_object, s_enum
-from tracing import set_current_task
+from tracing import set_current_task, trace, push_call
 
 WORKFLOWS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflows")
 
@@ -116,6 +116,13 @@ def route_workflow(task_id: str, input_text: str, client, _depth: int = 0) -> No
         client.log(task_id, msg, log_type)
 
     set_current_task(task_id)
+    if _depth == 0:
+        # Root of this task's whole call tree (no parent) — every nested
+        # push_call() (llm_structured(), run_concurrent() tasks, tool calls)
+        # ultimately traces back to this node. input_text persisted here
+        # since it's otherwise only ever fetched fresh from the VPS, never
+        # written anywhere local for the debug GUI to read.
+        trace("task_start", task_id=task_id, input_text=input_text)
     registry = load_workflows()
     print(f"\n  [ROUTER] Loaded {len(registry)} workflow(s): {list(registry.keys())}", flush=True)
 
@@ -132,7 +139,8 @@ def route_workflow(task_id: str, input_text: str, client, _depth: int = 0) -> No
 
     if workflow_name in registry:
         log(f"▶ Running: {workflow_name}", "info")
-        registry[workflow_name]["run"](task_id, input_text, client)
+        with push_call():
+            registry[workflow_name]["run"](task_id, input_text, client)
         return
 
     # Unknown intent — ask for clarification (once)

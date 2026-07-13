@@ -20,6 +20,8 @@ COPY schemas.py .
 COPY tracing.py .
 COPY tools_web.py .
 COPY tools_google.py .
+COPY invoke.py .
+COPY local_logs.py .
 COPY workflows/ ./workflows/
 COPY tests/ ./tests/
 COPY pytest.ini .

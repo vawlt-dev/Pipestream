@@ -14,6 +14,8 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
+from tracing import trace, push_call
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -62,30 +64,38 @@ def send_email(to: str, subject: str, body: str) -> str:
     Returns:
         Success or error message
     """
-    try:
-        creds = get_google_credentials()
-        service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
-        
-        # Create the email
-        message = MIMEText(body)
-        message['to'] = to
-        message['subject'] = subject
-        
-        # Encode it
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        
-        # Send it
-        sent = service.users().messages().send(
-            userId='me',
-            body={'raw': raw}
-        ).execute()
-        
-        return f"✅ Email sent to {to} (ID: {sent['id']})"
+    with push_call() as (call_id, parent_call_id):
+        trace("tool_call_started", call_id=call_id, parent_call_id=parent_call_id, tool="send_email", to=to, subject=subject)
+        try:
+            creds = get_google_credentials()
+            service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
 
-    except FileNotFoundError as e:
-        return f"❌ Auth error: {str(e)}"
-    except Exception as e:
-        return f"❌ Failed to send email: {str(e)}"
+            # Create the email
+            message = MIMEText(body)
+            message['to'] = to
+            message['subject'] = subject
+
+            # Encode it
+            raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+            # Send it
+            sent = service.users().messages().send(
+                userId='me',
+                body={'raw': raw}
+            ).execute()
+
+            result = f"✅ Email sent to {to} (ID: {sent['id']})"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="send_email", to=to, subject=subject, result=result, ok=True)
+            return result
+
+        except FileNotFoundError as e:
+            result = f"❌ Auth error: {str(e)}"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="send_email", to=to, subject=subject, result=result, ok=False)
+            return result
+        except Exception as e:
+            result = f"❌ Failed to send email: {str(e)}"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="send_email", to=to, subject=subject, result=result, ok=False)
+            return result
 
 
 def create_email_draft(to: str, subject: str, body: str) -> str:
@@ -96,26 +106,34 @@ def create_email_draft(to: str, subject: str, body: str) -> str:
     Returns:
         Success or error message
     """
-    try:
-        creds   = get_google_credentials()
-        service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
+    with push_call() as (call_id, parent_call_id):
+        trace("tool_call_started", call_id=call_id, parent_call_id=parent_call_id, tool="create_email_draft", to=to, subject=subject)
+        try:
+            creds   = get_google_credentials()
+            service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
 
-        message = MIMEText(body)
-        message['to']      = to
-        message['subject'] = subject
+            message = MIMEText(body)
+            message['to']      = to
+            message['subject'] = subject
 
-        raw   = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        draft = service.users().drafts().create(
-            userId='me',
-            body={'message': {'raw': raw}},
-        ).execute()
+            raw   = base64.urlsafe_b64encode(message.as_bytes()).decode()
+            draft = service.users().drafts().create(
+                userId='me',
+                body={'message': {'raw': raw}},
+            ).execute()
 
-        return f"✅ Draft created for {to} (ID: {draft['id']})"
+            result = f"✅ Draft created for {to} (ID: {draft['id']})"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="create_email_draft", to=to, subject=subject, result=result, ok=True)
+            return result
 
-    except FileNotFoundError as e:
-        return f"❌ Auth error: {str(e)}"
-    except Exception as e:
-        return f"❌ Failed to create draft: {str(e)}"
+        except FileNotFoundError as e:
+            result = f"❌ Auth error: {str(e)}"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="create_email_draft", to=to, subject=subject, result=result, ok=False)
+            return result
+        except Exception as e:
+            result = f"❌ Failed to create draft: {str(e)}"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="create_email_draft", to=to, subject=subject, result=result, ok=False)
+            return result
 
 
 def get_recent_emails(max_results: int = 10) -> list[dict]:
@@ -292,26 +310,32 @@ def send_reply(to: str, subject: str, body: str, thread_id: str, in_reply_to: st
 def create_calendar_event(summary: str, start_time: str, end_time: str, 
                           description: str = "", location: str = "") -> str:
     """Create a Google Calendar event."""
-    try:
-        import pytz
-        TIMEZONE = os.getenv("TIMEZONE", "Pacific/Auckland")
-        
-        creds = get_google_credentials()
-        service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
-        
-        event = {
-            'summary': summary,
-            'location': location,
-            'description': description,
-            'start': {'dateTime': start_time, 'timeZone': TIMEZONE},
-            'end': {'dateTime': end_time, 'timeZone': TIMEZONE},
-        }
-        
-        event = service.events().insert(calendarId='primary', body=event).execute()
-        return f"✅ Event created: {event.get('summary')}\n   Link: {event.get('htmlLink')}"
+    with push_call() as (call_id, parent_call_id):
+        trace("tool_call_started", call_id=call_id, parent_call_id=parent_call_id, tool="create_calendar_event", summary=summary, start_time=start_time, end_time=end_time)
+        try:
+            import pytz
+            TIMEZONE = os.getenv("TIMEZONE", "Pacific/Auckland")
 
-    except Exception as e:
-        return f"❌ Failed to create event: {str(e)}"
+            creds = get_google_credentials()
+            service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
+
+            event = {
+                'summary': summary,
+                'location': location,
+                'description': description,
+                'start': {'dateTime': start_time, 'timeZone': TIMEZONE},
+                'end': {'dateTime': end_time, 'timeZone': TIMEZONE},
+            }
+
+            event = service.events().insert(calendarId='primary', body=event).execute()
+            result = f"✅ Event created: {event.get('summary')}\n   Link: {event.get('htmlLink')}"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="create_calendar_event", summary=summary, result=result, ok=True)
+            return result
+
+        except Exception as e:
+            result = f"❌ Failed to create event: {str(e)}"
+            trace("tool_call", call_id=call_id, parent_call_id=parent_call_id, tool="create_calendar_event", summary=summary, result=result, ok=False)
+            return result
 
 def search_calendar_events(query: str = '', time_min: str = '', time_max: str = '',
                            max_results: int = 50) -> list[dict]:

@@ -16,9 +16,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, TypeVar
 
 import jsonschema
+import filelock
 from langchain_openai import ChatOpenAI
 
-from tracing import trace
+from tracing import trace, push_call, WORK_DIR
 from schemas import s_object, s_bool, s_string
 
 T = TypeVar("T")
@@ -90,7 +91,254 @@ _llm_structured = ChatOpenAI(**_BASE_KWARGS, temperature=0.1, max_tokens=768)
 #     The semaphore below is what actually prevents oversaturating LM Studio,
 #     regardless of how many chains/threads are running or nested.
 MAX_PARALLEL_LLM_CALLS = int(os.getenv("MAX_PARALLEL_LLM_CALLS", "4"))
-_llm_slot = threading.Semaphore(MAX_PARALLEL_LLM_CALLS)
+
+LIVE_STATE_PATH = os.path.join(WORK_DIR, "live_state.json")
+
+
+class ChainRegistry:
+    """
+    Cross-process registry + semaphore for individual call chains (one entry
+    per push_call()'d call_id), backed by a JSON file + filelock rather than
+    in-memory state. Three jobs in one state file, since they all need the
+    same cross-process coordination:
+
+      1. MAX_PARALLEL_LLM_CALLS enforcement — the original reason this
+         existed. A plain threading.Semaphore is invisible across processes;
+         the debug GUI's Test Runner runs as a separate native OS process
+         from the Dockerized worker, so both sides import this same core.py
+         and acquire/release against the SAME file instead of two
+         independent budgets that happen to both exist.
+      2. Manual chain control — pause/stop/resume any call_id, checked at
+         the one safe, honest checkpoint: the top of llm_structured(), right
+         before the real model call. A chain mid-network-I/O can't be
+         preempted instantly (same caveat as the existing Stop button
+         design) — pausing/stopping takes effect at the chain's next LLM
+         call, not this instant. Pausing/stopping a call_id also affects
+         every call_id nested under it: the checkpoint walks
+         tracing.current_call_stack() (the full root-to-here lineage, not
+         just the immediate call_id) and stops/pauses if ANY ancestor says
+         to, so pausing one research question's chain actually pauses every
+         LLM call several push_call() levels deeper inside it.
+      3. A basic priority system — every chain defaults to priority 0; the
+         debug GUI can uplift (positive) or suppress (negative) any
+         call_id. Only affects which queued chain gets the next freed slot,
+         nothing else. Manual decision overrides ("answer this one
+         yourself instead of the model") and prompt edits are staged here
+         too, consumed (popped) by llm_structured() on its next checkpoint.
+
+    The state file doubles as the GUI's Live Prompt Queue / Chain Explorer
+    display data — it was always going to be read for that; this makes it
+    load-bearing instead of cosmetic.
+    """
+
+    _DEFAULT_STATE = {"running": 0, "queued": 0, "completed_this_session": 0, "chains": {}}
+
+    def __init__(self, max_slots: int, state_path: str, poll_interval: float = 0.1):
+        self._max_slots = max_slots
+        self._state_path = state_path
+        self._file_lock = filelock.FileLock(state_path + ".lock")
+        self._poll_interval = poll_interval
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        if not os.path.exists(state_path):
+            with self._file_lock:
+                if not os.path.exists(state_path):
+                    self._write_state(dict(self._DEFAULT_STATE))
+
+    # -- low-level state file I/O --------------------------------------
+
+    def _read_state(self) -> dict:
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                state.setdefault("chains", {})
+                return state
+        except (FileNotFoundError, json.JSONDecodeError):
+            return dict(self._DEFAULT_STATE)
+
+    def _write_state(self, state: dict) -> None:
+        state["max_slots"] = self._max_slots
+        state["updated_at"] = datetime.now().isoformat()
+        tmp_path = self._state_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp_path, self._state_path)
+
+    # -- chain registry (display + control) ----------------------------
+
+    def register_chain(self, call_id: str, parent_call_id: str | None, task_id: str | None, schema_name: str) -> None:
+        with self._file_lock:
+            state = self._read_state()
+            state["chains"][call_id] = {
+                "parent_call_id": parent_call_id,
+                "task_id": task_id,
+                "schema_name": schema_name,
+                "status": "queued",
+                "control": "run",
+                "priority": 0,
+                "started_at": datetime.now().isoformat(),
+            }
+            self._write_state(state)
+
+    def unregister_chain(self, call_id: str) -> None:
+        with self._file_lock:
+            state = self._read_state()
+            state["chains"].pop(call_id, None)
+            self._write_state(state)
+
+    def update_chain(self, call_id: str, **fields) -> None:
+        with self._file_lock:
+            state = self._read_state()
+            chain = state["chains"].get(call_id)
+            if chain is not None:
+                chain.update(fields)
+                self._write_state(state)
+
+    def get_effective_control(self, call_stack: tuple[str, ...]) -> str:
+        """
+        'stop' if any ancestor in call_stack is stopped, else 'pause' if any
+        ancestor is paused, else 'run'. 'stop' wins over 'pause' so a
+        stopped parent can't be kept alive by an unrelated paused child.
+        """
+        with self._file_lock:
+            state = self._read_state()
+            controls = [state["chains"].get(cid, {}).get("control", "run") for cid in call_stack]
+        if "stop" in controls:
+            return "stop"
+        if "pause" in controls:
+            return "pause"
+        return "run"
+
+    def set_chain_control(self, call_id: str, control: str) -> None:
+        """GUI entry point — control is one of 'run' | 'pause' | 'stop'."""
+        self.update_chain(call_id, control=control)
+
+    def set_chain_priority(self, call_id: str, priority: int) -> None:
+        """GUI entry point — positive uplifts, negative suppresses, 0 is default."""
+        self.update_chain(call_id, priority=priority)
+
+    def stage_override(self, call_id: str, payload: dict) -> None:
+        """
+        GUI entry point — "make this decision yourself instead of the
+        model". The next llm_structured() checkpoint for this exact call_id
+        returns payload directly instead of invoking the real LLM, then
+        consumes (clears) it so it only applies once.
+        """
+        self.update_chain(call_id, override=payload)
+
+    def pop_override(self, call_id: str) -> dict | None:
+        with self._file_lock:
+            state = self._read_state()
+            chain = state["chains"].get(call_id)
+            if not chain or "override" not in chain:
+                return None
+            override = chain.pop("override")
+            self._write_state(state)
+            return override
+
+    def stage_edited_prompt(self, call_id: str, prompt: str) -> None:
+        """
+        GUI entry point — replace the prompt text for this call_id's next
+        (currently paused) LLM call before resuming it. Only the prompt
+        string is editable, not the schema — schemas are structural
+        contracts the calling code depends on; substituting an incompatible
+        one would just produce a parse failure downstream.
+        """
+        self.update_chain(call_id, edited_prompt=prompt)
+
+    def pop_edited_prompt(self, call_id: str) -> str | None:
+        with self._file_lock:
+            state = self._read_state()
+            chain = state["chains"].get(call_id)
+            if not chain or "edited_prompt" not in chain:
+                return None
+            prompt = chain.pop("edited_prompt")
+            self._write_state(state)
+            return prompt
+
+    # -- semaphore, priority-aware ---------------------------------------
+
+    def acquire_for(self, call_id: str, priority: int | None = None) -> None:
+        """
+        Blocking acquire for a specific call_id. When a slot is free and
+        multiple call_ids are queued, only the highest-priority one (ties
+        broken by earliest started_at) is allowed to claim it on a given
+        poll — every other waiter sees it didn't win and keeps polling.
+        Pure default behavior (everyone priority 0) degenerates to roughly
+        FIFO-ish, since whoever's poll happens to land first while eligible
+        wins; the priority field only matters once the GUI actually uplifts
+        or suppresses something.
+
+        priority defaults to None (leave whatever's already on the chain
+        record alone) rather than 0 — calling code never sets a non-default
+        priority itself (per design, ONLY the debug GUI's set_chain_priority()
+        does), so this must not clobber a priority the GUI staged before this
+        call was reached. Passing an explicit int here would override that;
+        nothing in this codebase does, but the parameter exists for
+        completeness.
+        """
+        # Only re-mark "queued" if there's actually something to change —
+        # register_chain() already sets status="queued" on every fresh
+        # call, so re-writing it again here on the (overwhelmingly common)
+        # never-paused path is a pure wasted write. Skipping it cuts real,
+        # measured write volume (confirmed contributing to high CPU/GUI
+        # unresponsiveness under load — every write here triggers an atomic
+        # rename, which fires a watchdog event, which triggers a GUI
+        # rebuild). Still re-marks unconditionally when resuming from
+        # "paused" (status differs) or when an explicit priority is passed.
+        with self._file_lock:
+            state = self._read_state()
+            current = state["chains"].get(call_id, {})
+            needs_write = priority is not None or current.get("status") != "queued"
+        if needs_write:
+            if priority is not None:
+                self.update_chain(call_id, priority=priority, status="queued")
+            else:
+                self.update_chain(call_id, status="queued")
+        while True:
+            with self._file_lock:
+                state = self._read_state()
+                if state.get("running", 0) >= self._max_slots:
+                    pass
+                else:
+                    chains = state["chains"]
+                    queued = [
+                        (cid, c.get("priority", 0), c.get("started_at", ""))
+                        for cid, c in chains.items()
+                        if c.get("status") == "queued"
+                    ]
+                    if queued:
+                        queued.sort(key=lambda t: (-t[1], t[2]))
+                        winner_id = queued[0][0]
+                    else:
+                        winner_id = call_id  # not registered as queued (shouldn't normally happen)
+                    if winner_id == call_id:
+                        state["running"] = state.get("running", 0) + 1
+                        chain = chains.get(call_id)
+                        if chain is not None:
+                            chain["status"] = "running"
+                        self._write_state(state)
+                        return
+            time.sleep(self._poll_interval)
+
+    def release_for(self, call_id: str) -> None:
+        with self._file_lock:
+            state = self._read_state()
+            state["running"] = max(0, state.get("running", 0) - 1)
+            state["completed_this_session"] = state.get("completed_this_session", 0) + 1
+            self._write_state(state)
+
+
+_llm_slot = ChainRegistry(MAX_PARALLEL_LLM_CALLS, LIVE_STATE_PATH)
+
+
+def _check_chain_control(call_id: str) -> str:
+    """
+    Effective pause/stop state for call_id, considering every ancestor in
+    its push_call() lineage (see tracing.current_call_stack()) — pausing or
+    stopping a chain at any level pauses/stops everything nested under it.
+    """
+    from tracing import current_call_stack
+    return _llm_slot.get_effective_control(current_call_stack())
 
 
 def run_concurrent(tasks: list[Callable[[], T]], max_workers: int = 16) -> list[T]:
@@ -115,14 +363,31 @@ def run_concurrent(tasks: list[Callable[[], T]], max_workers: int = 16) -> list[
     concurrently by more than one thread at a time, only sequentially;
     sharing one across simultaneously-running futures raises "cannot enter
     context: ... is already entered".
+
+    Each task also gets its own push_call() automatically — the copied
+    context carries whatever call_id was active in the submitting thread, so
+    push_call() (entered fresh inside each task) correctly parents the new
+    call under that, not under some grandparent. This is what makes nested
+    run_concurrent() calls (e.g. gather_info()'s outer question batch, whose
+    persona-level item spawns its own inner 3-wide batch) produce a real
+    tree instead of a flat list — no call site needs to change to get this,
+    it's automatic for every task submitted here.
     """
+    def _run_with_call_id(fn: Callable[[], T]) -> T:
+        with push_call():
+            return fn()
+
     if len(tasks) <= 1:
-        return [t() for t in tasks]
+        results = []
+        for t in tasks:
+            with push_call():
+                results.append(t())
+        return results
 
     results: list = [None] * len(tasks)
     with ThreadPoolExecutor(max_workers=min(len(tasks), max_workers)) as executor:
         future_to_index = {
-            executor.submit(contextvars.copy_context().run, fn): i
+            executor.submit(contextvars.copy_context().run, _run_with_call_id, fn): i
             for i, fn in enumerate(tasks)
         }
         for future in as_completed(future_to_index):
@@ -169,28 +434,82 @@ def llm_structured(prompt: str, schema: dict, schema_name: str = "response") -> 
         "json_schema": {"name": schema_name, "strict": True, "schema": schema},
     }
     dbg_block(f"LLM STRUCTURED PROMPT  ({len(prompt)} chars)", prompt)
-    t0 = time.time()
-    with _llm_slot:
-        t1      = time.time()  # wait_s = t1 - t0: time spent queued behind MAX_PARALLEL_LLM_CALLS
-        response = _llm_structured.invoke(prompt, response_format=response_format).content
-    elapsed  = time.time() - t1
-    wait_s   = t1 - t0
-    dbg_block(f"LLM STRUCTURED RESPONSE  ({len(response)} chars, {elapsed:.1f}s, waited {wait_s:.1f}s)", response)
 
-    try:
-        parsed = json.loads(response)
-        trace(
-            "llm_call", schema_name=schema_name, prompt=prompt, schema=schema,
-            response=response, parsed=parsed, elapsed_s=round(elapsed, 2), wait_s=round(wait_s, 2),
-        )
-        return parsed
-    except Exception:
-        dbg(f"llm_structured: failed to parse JSON response")
-        trace(
-            "llm_call_parse_failed", schema_name=schema_name, prompt=prompt,
-            schema=schema, response=response, elapsed_s=round(elapsed, 2), wait_s=round(wait_s, 2),
-        )
-        return {}
+    from tracing import get_current_task
+    task_id = get_current_task()
+
+    with push_call() as (call_id, parent_call_id):
+        _llm_slot.register_chain(call_id, parent_call_id, task_id, schema_name)
+        # Emitted before the semaphore acquire — without this, a call that's
+        # been queued/running for 90s is invisible until it finishes. Paired
+        # with the llm_call/llm_call_parse_failed event below via call_id, so
+        # the GUI can render a real queued->running->done lifecycle.
+        trace("llm_call_started", call_id=call_id, parent_call_id=parent_call_id, schema_name=schema_name)
+
+        try:
+            # Manual decision override — the debug GUI can stage a literal
+            # response dict for this exact call_id ("answer this yourself
+            # instead of the model"). Checked BEFORE the model is ever
+            # invoked; consumed (popped) so it only applies once.
+            override = _llm_slot.pop_override(call_id)
+            if override is not None:
+                trace("llm_call_manual_override", call_id=call_id, parent_call_id=parent_call_id, schema_name=schema_name, override=override)
+                return override
+
+            # Pause/stop checkpoint — the one safe, honest place to apply
+            # manual chain control. A chain mid-network-I/O can't be
+            # preempted instantly; this takes effect at the chain's next LLM
+            # call, same caveat as the existing Stop button. Checks every
+            # ancestor in this call's push_call() lineage, not just this
+            # call_id, so pausing/stopping a higher-level chain (e.g. one
+            # research question) takes effect for everything nested under it.
+            while True:
+                control = _check_chain_control(call_id)
+                if control == "stop":
+                    trace("llm_call_stopped", call_id=call_id, parent_call_id=parent_call_id, schema_name=schema_name)
+                    return {}
+                if control != "pause":
+                    break
+                _llm_slot.update_chain(call_id, status="paused")
+                time.sleep(0.2)
+
+            # An edited prompt staged while paused replaces the original —
+            # only the prompt text is editable, not the schema (see
+            # stage_edited_prompt's docstring for why).
+            edited = _llm_slot.pop_edited_prompt(call_id)
+            if edited is not None:
+                prompt = edited
+                dbg_block(f"LLM STRUCTURED PROMPT (edited, {len(prompt)} chars)", prompt)
+
+            t0 = time.time()
+            _llm_slot.acquire_for(call_id)
+            try:
+                t1      = time.time()  # wait_s = t1 - t0: time spent queued behind MAX_PARALLEL_LLM_CALLS
+                response = _llm_structured.invoke(prompt, response_format=response_format).content
+            finally:
+                _llm_slot.release_for(call_id)
+            elapsed  = time.time() - t1
+            wait_s   = t1 - t0
+            dbg_block(f"LLM STRUCTURED RESPONSE  ({len(response)} chars, {elapsed:.1f}s, waited {wait_s:.1f}s)", response)
+
+            try:
+                parsed = json.loads(response)
+                trace(
+                    "llm_call", call_id=call_id, parent_call_id=parent_call_id,
+                    schema_name=schema_name, prompt=prompt, schema=schema,
+                    response=response, parsed=parsed, elapsed_s=round(elapsed, 2), wait_s=round(wait_s, 2),
+                )
+                return parsed
+            except Exception:
+                dbg(f"llm_structured: failed to parse JSON response")
+                trace(
+                    "llm_call_parse_failed", call_id=call_id, parent_call_id=parent_call_id,
+                    schema_name=schema_name, prompt=prompt,
+                    schema=schema, response=response, elapsed_s=round(elapsed, 2), wait_s=round(wait_s, 2),
+                )
+                return {}
+        finally:
+            _llm_slot.unregister_chain(call_id)
 
 
 # =============================================================================
@@ -342,19 +661,36 @@ def disambiguate_if_needed(
         return topic
 
     task = client.get_task(task_id)
-    if task and task.get("trusted"):
+    trusted = bool(task and task.get("trusted"))
+    if trusted:
         best_guess = pick_best_guess_candidate(topic, candidates, known_context_hint)
         if not best_guess:
+            trace(
+                "disambiguation_decision", task_id=task_id, topic=topic,
+                candidates=candidates, trusted=trusted, auto_picked=None, asked=False,
+            )
             return topic
         resolved = f"{topic} ({best_guess})"
         log(f"🤖 (trusted) Ambiguous '{topic}' — auto-picked: {best_guess}", "info")
+        trace(
+            "disambiguation_decision", task_id=task_id, topic=topic,
+            candidates=candidates, trusted=trusted, auto_picked=best_guess, asked=False,
+        )
     else:
         question = build_disambiguation_question(topic, candidates, known_context_hint)
         log(f"❓ Ambiguous entity — asking for clarification: {question}", "info")
         answer = wait_for_input(task_id, question, client)
         if not answer:
+            trace(
+                "disambiguation_decision", task_id=task_id, topic=topic,
+                candidates=candidates, trusted=trusted, auto_picked=None, asked=True, answer=None,
+            )
             return topic
         resolved = f"{topic} ({answer.strip()})"
+        trace(
+            "disambiguation_decision", task_id=task_id, topic=topic,
+            candidates=candidates, trusted=trusted, auto_picked=None, asked=True, answer=answer.strip(),
+        )
 
     memory_set_question(
         topic, "prospect", _DISAMBIGUATION_QID,
@@ -690,11 +1026,15 @@ def check_draft_appropriateness(draft_body: str, company_name: str) -> dict:
     # default risks shipping exactly the kind of draft this gate exists to
     # catch.
     if not result:
-        return {"appropriate": False, "concern": "Safety check failed to return a usable verdict — treating as unsafe."}
-    return {
+        verdict = {"appropriate": False, "concern": "Safety check failed to return a usable verdict — treating as unsafe."}
+        trace("draft_appropriateness", company_name=company_name, **verdict, parse_failed=True)
+        return verdict
+    verdict = {
         "appropriate": bool(result.get("appropriate", False)),
         "concern": str(result.get("concern") or "").strip(),
     }
+    trace("draft_appropriateness", company_name=company_name, **verdict, parse_failed=False)
+    return verdict
 
 
 def clean_subject_line(subject: str) -> str:

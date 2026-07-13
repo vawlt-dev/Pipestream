@@ -390,6 +390,10 @@ def answer_question(
     """
     if not force_refresh:
         cached = memory_get_question(topic, topic_level, question_id)
+        trace(
+            "memory_read", task_id=task_id, topic=topic, topic_level=topic_level,
+            question_id=question_id, hit=bool(cached),
+        )
         if cached:
             log(f"📚 cached: {question_text}", "info")
             return cached

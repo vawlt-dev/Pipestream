@@ -17,11 +17,12 @@ from core import (
     clean_email_draft, clean_subject_line, extract_greeting_name,
     check_draft_appropriateness, check_cancelled, run_concurrent,
 )
-from schemas import s_object, s_string, s_int, s_array
+from schemas import s_object, s_string, s_int, s_array, s_bool
 from research import find_contact_email
 from tools_web import web_search
 from tools_google import create_email_draft
 from memory import memory_get_contacted_prospects, memory_record_outreach, _normalize
+from tracing import trace
 
 WORKFLOW_META = {
     "name": "lead_gen_outreach",
@@ -58,6 +59,7 @@ _PARSED_REQUEST_SCHEMA = s_object({
     "count":          s_int(),
 })
 
+_META_LEADGEN_SCHEMA   = s_object({"is_meta_leadgen": s_bool()})
 _SEARCH_QUERIES_SCHEMA = s_object({"queries": s_array(s_string())})
 _ANGLE_SCHEMA          = s_object({"angle": s_string()})
 _DRAFT_BODY_SCHEMA     = s_object({"body": s_string()})
@@ -145,17 +147,19 @@ def run(task_id: str, input_text: str, client) -> None:
     log('🔍 Generating prospect search queries...', 'info')
 
     queries_result = llm_structured(
-        f'A company needs to find prospective CLIENTS — companies that NEED this kind '
-        f'of help, not companies that PROVIDE similar or competing services.\n\n'
-        f'Their company: {sender_company}\n'
-        f'What they do: {own_context}\n'
+        f'Generate web search queries to find real companies that fit this specific goal:\n\n'
         f'Goal: {goal}\n\n'
-        f'Generate 4 distinct web search queries to find real companies that would '
-        f'be good prospects for this goal. Phrase each query around companies '
-        f'experiencing the problem or need described in the goal — NOT around '
-        f'companies that already offer that same service (those are competitors, '
-        f'not prospects). Each query should be aimed at surfacing actual company '
-        f'names and websites, not generic articles.',
+        f'Context — their company: {sender_company}\n'
+        f'What {sender_company} does: {own_context}\n\n'
+        f'Generate 4 distinct web search queries, each aimed at surfacing actual '
+        f'company names and websites (not generic articles), that match the GOAL as '
+        f'stated above. Let the goal itself decide what kind of company to search '
+        f'for — do not assume the relationship is "companies that need {sender_company}\'s '
+        f'core product or service" unless the goal actually says so. For example: if the '
+        f'goal is to find clients who need {sender_company}\'s help, search for companies '
+        f'experiencing that need. If the goal is instead to find advertisers, partners, '
+        f'suppliers, sponsors, or any other kind of relationship, search for companies '
+        f'that fit THAT specific relationship instead.',
         _SEARCH_QUERIES_SCHEMA,
         schema_name="search_queries",
     )
@@ -182,13 +186,17 @@ def run(task_id: str, input_text: str, client) -> None:
 
     extracted = llm_structured(
         f'From these search results, extract a list of distinct real company names '
-        f'that could be prospects for "{sender_company}" (goal: {goal}).\n\n'
+        f'that are good prospects for this specific goal:\n\n'
+        f'Goal: {goal}\n'
+        f'Their company: {sender_company}\n\n'
         f'Exclude: {sender_company} itself, directory/listing sites, news aggregators, '
-        f'generic terms, AND any company that appears to PROVIDE the same or a '
-        f'competing service to {sender_company} rather than NEEDING it — those are '
-        f'competitors, not prospects, even if they show up prominently in the results.\n\n'
-        f'For each company, give its name and a one-line reason it fits as a prospect '
-        f'(not a competitor).\n\n'
+        f'and generic terms. Beyond that, judge fit strictly against the GOAL as stated '
+        f'above — do not assume the relationship is "companies that need {sender_company}\'s '
+        f'core product or service" unless the goal actually says so; a goal like finding '
+        f'advertisers, partners, sponsors, or suppliers implies a different kind of fit '
+        f'entirely, and a company offering the same service as {sender_company} is only '
+        f'a competitor to exclude if the goal is actually about finding clients/customers.\n\n'
+        f'For each company, give its name and a one-line reason it fits the goal.\n\n'
         f'Search results:\n{combined_results[:10000]}',
         _CANDIDATE_SCHEMA,
         schema_name="candidate_companies",
